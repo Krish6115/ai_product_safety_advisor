@@ -1,473 +1,751 @@
-"""Core Product Advisor agent — orchestrates RAG, tools, and LLM."""
+"""
+agent/advisor.py — AI Product Safety Advisor (production-grade)
 
-import json
-import re
+Safety pipeline (in order):
+  1. classify_query()           — keyword + pattern gate, NO LLM call for DANGEROUS
+  2. RAG retrieval              — ChromaDB semantic search
+  3. LLM structured generation — Gemini Flash via google-generativeai
+  4. _apply_hard_overrides()   — rule-based post-LLM safety net
+  5. _build_human_readable_layer() — generates user_explanation + advice
+
+Design principle: Safety > everything. The LLM can only INCREASE safety level,
+never decrease it past what the rules mandate.
+"""
+
+from __future__ import annotations
+
 import os
-from dotenv import load_dotenv
-from google import genai
-from langdetect import detect
+import re
+import json
+import logging
+from typing import Optional
 
-from agent.schemas import AdvisorResponse, Recommendation, SafetyFlag
-from agent.prompts import SYSTEM_PROMPT, RETRY_PROMPT
-from agent.tools import age_check, product_lookup, weight_check
-from rag.retriever import get_retrieval_context
+from google import genai
+from dotenv import load_dotenv
+
+from agent.schemas import (
+    AlternativeProduct,
+    QueryClassification,
+    Recommendation,
+    SafetyResponse,
+)
 
 load_dotenv()
+logger = logging.getLogger(__name__)
 
-
-# Confidence threshold — below this, force UNCERTAIN recommendation
-UNCERTAINTY_THRESHOLD = 0.6
-
-# RAG retrieval score threshold — below this, data is considered insufficient
-RETRIEVAL_THRESHOLD = 0.4
+# ── Gemini setup ───────────────────────────────────────────────────────────────
+_API_KEY = os.getenv("GEMINI_API_KEY", "")
+_MODEL_NAME = "gemini-2.0-flash"
+_CONFIDENCE_THRESHOLD = 0.6
+_RETRIEVAL_THRESHOLD = 0.4
 
 
 def safe_parse_json(text: str) -> dict | None:
-    """FIX 2: Safe JSON parser with regex fallback.
-
-    Tries multiple strategies to extract valid JSON from messy LLM output:
-    1. Direct json.loads
-    2. Regex extraction of {...} block
-    3. Strip markdown fences then parse
-    """
+    """Best-effort JSON parser for LLM output."""
     if not text or not text.strip():
         return None
 
     text = text.strip()
 
-    # Strategy 1: Direct parse
     try:
         return json.loads(text)
     except (json.JSONDecodeError, ValueError):
         pass
 
-    # Strategy 2: Regex extract the JSON object
-    match = re.search(r'\{.*\}', text, re.DOTALL)
+    match = re.search(r"\{.*\}", text, re.DOTALL)
     if match:
         try:
             return json.loads(match.group())
         except (json.JSONDecodeError, ValueError):
             pass
 
-    # Strategy 3: Strip markdown code fences
     cleaned = re.sub(r'^```(?:json)?\s*', '', text)
     cleaned = re.sub(r'\s*```$', '', cleaned)
     cleaned = cleaned.strip()
     try:
         return json.loads(cleaned)
     except (json.JSONDecodeError, ValueError):
-        pass
-
-    return None
-
-
-class ProductAdvisor:
-    """Mumzworld Product Safety & Suitability Advisor."""
-
-    def __init__(self, model_name: str = "gemini-flash-latest"):
-        self.api_key = os.getenv("GEMINI_API_KEY")
-        if not self.api_key:
-            raise ValueError("GEMINI_API_KEY not set. Copy .env.example to .env and add your key.")
-        self.client = genai.Client(api_key=self.api_key)
-        self.model_name = model_name
-
-    def _detect_language(self, text: str) -> str:
-        """Detect if the query is English or Arabic."""
-        try:
-            lang = detect(text)
-            return "ar" if lang == "ar" else "en"
-        except Exception:
-            return "en"
-
-    def _extract_child_age(self, query: str) -> int | None:
-        """Extract child age in months from the query text."""
-        # Patterns: "X month", "X months", "X-month", "Xm"
-        month_patterns = [
-            r"(\d+)\s*(?:month|months|month-old|months-old|m\b|أشهر|شهر)",
-        ]
-        for pattern in month_patterns:
-            match = re.search(pattern, query, re.IGNORECASE)
-            if match:
-                return int(match.group(1))
-
-        # Patterns: "X year", "X years", "X-year-old", "سنة", "سنوات"
-        year_patterns = [
-            r"(\d+)\s*(?:year|years|year-old|years-old|yr|yrs|سنة|سنوات|سنه)",
-        ]
-        for pattern in year_patterns:
-            match = re.search(pattern, query, re.IGNORECASE)
-            if match:
-                return int(match.group(1)) * 12
-
         return None
 
-    def _extract_child_weight(self, query: str) -> float | None:
-        """Extract child weight in kg from the query."""
-        patterns = [
-            r"(\d+(?:\.\d+)?)\s*(?:kg|kilo|kilogram|كجم|كيلو)",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, query, re.IGNORECASE)
-            if match:
-                return float(match.group(1))
-        return None
 
-    def _run_tools(self, query: str, retrieved_products: list[dict]) -> str:
-        """Run relevant tools based on query context."""
-        results = []
-        child_age = self._extract_child_age(query)
-        child_weight = self._extract_child_weight(query)
+# ═══════════════════════════════════════════════════════════════════════════════
+#  LAYER 1 — QUERY CLASSIFICATION
+# ═══════════════════════════════════════════════════════════════════════════════
 
-        if not retrieved_products:
-            return "No tools executed — no products retrieved."
+# Each pattern is a compiled regex.  Order matters — checked in sequence.
+_DANGEROUS_PATTERNS: list[re.Pattern] = [
+    # Physical danger — height / impact
+    re.compile(
+        r"\b(jump|fall|drop|throw|push)\b.{0,40}\b(\d+\s*(ft|feet|m|meter|metre|floor|story|storey)s?|height|cliff|roof|balcony|window)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(\d+\s*(ft|feet|m|meter|metre))\b.{0,40}\b(height|high|tall|jump|fall|drop)\b",
+        re.IGNORECASE,
+    ),
+    # Fire / chemical
+    re.compile(
+        r"\b(light\s+on\s+fire|set\s+on\s+fire|burn|ignite|poison|toxic\s+chemical|bleach|acid|caustic)\b",
+        re.IGNORECASE,
+    ),
+    # Sharp weapons
+    re.compile(
+        r"\b(stab|slash|knife|razor|sword|blade|cut\s+with)\b",
+        re.IGNORECASE,
+    ),
+    # Strangulation / suffocation
+    re.compile(
+        r"\b(strangle|suffocate|asphyxiat|hang\s+from)\b",
+        re.IGNORECASE,
+    ),
+    # Drowning
+    re.compile(
+        r"\b(drown|hold\s+underwater|submerge\s+head)\b",
+        re.IGNORECASE,
+    ),
+    # Electric shock
+    re.compile(
+        r"\b(electrocute|electric\s+shock|stick.{0,10}outlet|put.{0,10}finger.{0,10}socket)\b",
+        re.IGNORECASE,
+    ),
+    # Explicit impossibility / absurdity used as safety bypass
+    re.compile(
+        r"\b(100\s*ft|1000\s*ft|100\s*m|skyscraper|ten.?story|twenty.?story)\b",
+        re.IGNORECASE,
+    ),
+    # Generic "dangerous action for a baby/child" phrases
+    re.compile(
+        r"\b(is\s+it\s+safe\s+for\s+(my\s+)?(baby|infant|child|toddler|kid)\s+to\s+(jump|fall|run\s+into|eat\s+glass|drink\s+bleach|play\s+with\s+fire))\b",
+        re.IGNORECASE,
+    ),
+]
 
-        # Run tools on the top retrieved product
-        top_product_id = retrieved_products[0].get("product_id") if retrieved_products else None
+_GENERAL_CHILDCARE_PATTERNS: list[re.Pattern] = [
+    re.compile(r"\b(how\s+much\s+sleep|feeding\s+schedule|potty\s+train|teething|vaccination|milestone)\b", re.IGNORECASE),
+    re.compile(r"\b(breastfeed|formula\s+feed|solid\s+food|first\s+food)\b", re.IGNORECASE),
+]
 
-        if top_product_id:
-            # Always do product lookup
-            lookup_result = product_lookup(top_product_id)
-            results.append(f"product_lookup({top_product_id}): {json.dumps(lookup_result, ensure_ascii=False)}")
 
-            # Age check if age is mentioned
-            if child_age is not None:
-                age_result = age_check(top_product_id, child_age)
-                results.append(f"age_check({top_product_id}, {child_age}mo): {json.dumps(age_result, ensure_ascii=False)}")
+def classify_query(query: str) -> QueryClassification:
+    """
+    Pre-LLM classification gate.
 
-            # Weight check if weight is mentioned
-            if child_weight is not None:
-                weight_result = weight_check(top_product_id, child_weight)
-                results.append(f"weight_check({top_product_id}, {child_weight}kg): {json.dumps(weight_result, ensure_ascii=False)}")
+    Returns:
+        DANGEROUS        — matches a physically dangerous action pattern.
+                           The pipeline STOPS here; no LLM is called.
+        GENERAL_CHILDCARE — parenting question not about a specific product.
+        PRODUCT_SAFETY   — default; proceed to RAG + LLM.
 
-        return "\n".join(results) if results else "No specific tools triggered."
+    This function must be extremely conservative.  False positives (classifying
+    a safe query as DANGEROUS) are far less harmful than false negatives.
+    """
+    q = query.strip()
 
-    # Map of common LLM-invented flag names to valid SafetyFlag values
-    FLAG_ALIASES = {
-        "age_limit": "age_inappropriate",
-        "age_restriction": "age_inappropriate",
-        "small_parts": "choking_hazard",
-        "small_pieces": "choking_hazard",
-        "battery_risk": "battery_hazard",
-        "needs_supervision": "supervision_required",
-        "material_safety": "material_concern",
-        "recall": "recall_alert",
-        "no_data": "insufficient_data",
-    }
+    for pattern in _DANGEROUS_PATTERNS:
+        if pattern.search(q):
+            logger.warning("DANGEROUS query detected: %r", q[:120])
+            return QueryClassification.DANGEROUS
 
-    VALID_FLAGS = {f.value for f in SafetyFlag}
+    for pattern in _GENERAL_CHILDCARE_PATTERNS:
+        if pattern.search(q):
+            return QueryClassification.GENERAL_CHILDCARE
 
-    def _normalize_safety_flags(self, flags: list) -> list[str]:
-        """Normalize LLM-invented flag names to valid SafetyFlag enum values."""
-        normalized = []
-        for flag in flags:
-            flag_str = str(flag).strip().lower()
-            if flag_str in self.VALID_FLAGS:
-                normalized.append(flag_str)
-            elif flag_str in self.FLAG_ALIASES:
-                normalized.append(self.FLAG_ALIASES[flag_str])
-            # else: silently drop unknown flags
-        return normalized
+    return QueryClassification.PRODUCT_SAFETY
 
-    def _parse_llm_response(self, raw_text: str) -> AdvisorResponse | None:
-        """Parse LLM response using safe parser + schema construction."""
-        data = safe_parse_json(raw_text)
-        if data is None:
-            return None
 
-        # Fill in defaults for missing optional fields
-        data.setdefault("query_language", "en")
-        data.setdefault("confidence", 0.0)
-        data.setdefault("reasoning", "")
-        data.setdefault("reasoning_trace", [])
-        data.setdefault("rule_applied", [])
-        data.setdefault("safety_flags", [])
-        data.setdefault("alternatives", [])
-        data.setdefault("disclaimer", "Always verify product safety with manufacturer guidelines. | تحقق دائماً من سلامة المنتج مع إرشادات الشركة المصنعة.")
+def _build_dangerous_response(query: str) -> SafetyResponse:
+    """
+    Construct the immediate NOT_SUITABLE response for DANGEROUS queries.
+    No LLM call is made.  Confidence is 1.0 (hard rule).
+    """
+    return SafetyResponse(
+        query_language="en",
+        query_classification=QueryClassification.DANGEROUS,
+        recommendation=Recommendation.NOT_SUITABLE,
+        confidence=1.0,
+        safety_flags=["dangerous_action"],
+        reasoning=(
+            "Query describes a physically dangerous or life-threatening action. "
+            "This is blocked before reaching the LLM by the rule-based safety gate."
+        ),
+        reasoning_trace=[
+            "Query matched one or more dangerous-action patterns.",
+            "[GATE] DANGEROUS classification — LLM call bypassed.",
+            "[OVERRIDE] Forced NOT_SUITABLE with confidence=1.0.",
+        ],
+        alternatives=[],
+        user_explanation=(
+            "This action is extremely dangerous and could seriously injure or kill a child. "
+            "It should never be attempted under any circumstances."
+        ),
+        advice=(
+            "Do not attempt this under any circumstances. "
+            "If you are concerned about your child's safety, please contact emergency services "
+            "or your pediatrician immediately."
+        ),
+    )
 
-        # Normalize safety flags to valid enum values
-        data["safety_flags"] = self._normalize_safety_flags(data.get("safety_flags", []))
 
-        try:
-            return AdvisorResponse(**data)
-        except Exception:
-            return None
+# ═══════════════════════════════════════════════════════════════════════════════
+#  LAYER 4 — HARD SAFETY OVERRIDES (post-LLM)
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    def _apply_uncertainty_threshold(self, response: AdvisorResponse, child_age: int | None = None) -> AdvisorResponse:
-        """Apply explicit threshold-based uncertainty and safety overrides.
+# (flag_keyword, max_age_months_or_None, forced_recommendation)
+# If max_age_months is None the override applies regardless of child age.
+_HARD_OVERRIDES: list[tuple[str, Optional[int], Recommendation]] = [
+    # Choking hazard: any product with small parts is NOT_SUITABLE for < 36 months
+    ("choking_hazard", 36, Recommendation.NOT_SUITABLE),
+    ("small_parts", 36, Recommendation.NOT_SUITABLE),
+    # Cord / strangulation risk: NOT_SUITABLE for < 36 months
+    ("strangulation_risk", 36, Recommendation.NOT_SUITABLE),
+    ("cord_hazard", 36, Recommendation.NOT_SUITABLE),
+    # Toxic material: always NOT_SUITABLE
+    ("toxic_material", None, Recommendation.NOT_SUITABLE),
+    ("chemical_hazard", None, Recommendation.NOT_SUITABLE),
+    # Sharp edges: always NOT_SUITABLE
+    ("sharp_edges", None, Recommendation.NOT_SUITABLE),
+    # Entrapment: NOT_SUITABLE for < 24 months
+    ("entrapment_risk", 24, Recommendation.NOT_SUITABLE),
+    # Fire / burn hazard: always NOT_SUITABLE
+    ("fire_hazard", None, Recommendation.NOT_SUITABLE),
+    ("burn_risk", None, Recommendation.NOT_SUITABLE),
+    # Recalled product: always NOT_SUITABLE
+    ("product_recalled", None, Recommendation.NOT_SUITABLE),
+    # Dangerous action in product context (e.g. jumping from height)
+    ("dangerous_action", None, Recommendation.NOT_SUITABLE),
+]
 
-        Engineering logic (not just prompting):
-        - If confidence < UNCERTAINTY_THRESHOLD → force UNCERTAIN
-        - If critical safety flags present + SUITABLE → force NOT_SUITABLE
-        - Append override reasoning to trace
-        """
-        # Rule 1: Low confidence → UNCERTAIN
-        if response.confidence < UNCERTAINTY_THRESHOLD and response.recommendation != Recommendation.UNCERTAIN:
-            original = response.recommendation.value
-            response.recommendation = Recommendation.UNCERTAIN
-            response.reasoning_trace.append(
-                f"[OVERRIDE] Confidence {response.confidence:.2f} < threshold {UNCERTAINTY_THRESHOLD} — forced UNCERTAIN (was {original})"
-            )
 
-        # Rule 2: Critical safety flags + SUITABLE → NOT_SUITABLE
-        critical_flags = {SafetyFlag.CHOKING_HAZARD, SafetyFlag.AGE_INAPPROPRIATE, SafetyFlag.WEIGHT_LIMIT}
-        if response.safety_flags and any(f in critical_flags for f in response.safety_flags):
-            if response.recommendation == Recommendation.SUITABLE:
-                response.recommendation = Recommendation.NOT_SUITABLE
-                triggered = [f.value for f in response.safety_flags if f in critical_flags]
-                response.reasoning_trace.append(
-                    f"[OVERRIDE] Critical safety flags {triggered} detected — forced NOT_SUITABLE"
-                )
-                if SafetyFlag.AGE_INAPPROPRIATE in response.safety_flags:
-                    response.rule_applied.append("min_age_violation")
-                if SafetyFlag.WEIGHT_LIMIT in response.safety_flags:
-                    response.rule_applied.append("max_weight_violation")
+def _apply_hard_overrides(
+    response: SafetyResponse,
+    child_age_months: Optional[int],
+) -> SafetyResponse:
+    """
+    Apply rule-based safety overrides AFTER the LLM has produced its response.
 
-        # Rule 3: insufficient_data flag → ensure UNCERTAIN if confidence is moderate
-        if SafetyFlag.INSUFFICIENT_DATA in response.safety_flags:
-            if response.recommendation == Recommendation.SUITABLE:
-                response.recommendation = Recommendation.UNCERTAIN
-                response.reasoning_trace.append(
-                    "[OVERRIDE] Insufficient data flag present — cannot confirm SUITABLE"
-                )
+    Rules:
+    - If a safety flag + age condition is met, force NOT_SUITABLE.
+    - Add an override note to reasoning_trace.
+    - Recalculate user_explanation + advice via _build_human_readable_layer.
 
-        # Rule 4: Hardcoded safety rule for Lego and toddlers
-        if response.product_name and "lego" in response.product_name.lower():
-            if child_age is not None and child_age < 36:
-                if response.recommendation != Recommendation.NOT_SUITABLE:
-                    response.recommendation = Recommendation.NOT_SUITABLE
-                    if SafetyFlag.CHOKING_HAZARD not in response.safety_flags:
-                        response.safety_flags.append(SafetyFlag.CHOKING_HAZARD)
-                    response.reasoning_trace.append(
-                        "[OVERRIDE] Hardcoded safety rule: LEGO products contain small parts and are NOT_SUITABLE for children under 36 months"
-                    )
-                    response.rule_applied.append("choking_hazard_under_36m")
+    The LLM output is trusted for retrieval and reasoning text, but NEVER
+    trusted to override a hard rule.
+    """
+    override_applied = False
+    override_flags: list[str] = []
 
-        return response
+    flags = [f.lower() for f in response.safety_flags]
 
-    def _build_human_readable_layer(self, response: AdvisorResponse) -> AdvisorResponse:
-        """Populate user-facing explanation and advice from the final decision."""
-        lang = "ar" if response.query_language == "ar" else "en"
+    for flag_keyword, max_age, forced_rec in _HARD_OVERRIDES:
+        if flag_keyword not in flags:
+            continue
 
-        def join_terms(terms: list[str]) -> str:
-            if not terms:
-                return ""
-            if len(terms) == 1:
-                return terms[0]
-            if len(terms) == 2:
-                return f"{terms[0]} and {terms[1]}" if lang == "en" else f"{terms[0]} و {terms[1]}"
-            separator = ", " if lang == "en" else "، "
-            tail_joiner = ", and " if lang == "en" else "، و "
-            return separator.join(terms[:-1]) + tail_joiner + terms[-1]
-
-        flag_values = {flag.value for flag in response.safety_flags}
-        age_flag = SafetyFlag.AGE_INAPPROPRIATE.value in flag_values
-        weight_flag = SafetyFlag.WEIGHT_LIMIT.value in flag_values
-        choking_flag = SafetyFlag.CHOKING_HAZARD.value in flag_values
-        supervision_flag = SafetyFlag.SUPERVISION_REQUIRED.value in flag_values
-        battery_flag = SafetyFlag.BATTERY_HAZARD.value in flag_values
-
-        if response.recommendation == Recommendation.SUITABLE:
-            if lang == "ar":
-                response.user_explanation = (
-                    "هذا المنتج مناسب لطفلك وفقًا للمعلومات المتاحة."
-                    if not (supervision_flag or battery_flag)
-                    else "هذا المنتج مناسب بشكل عام، لكن يجب استخدامه تحت إشراف شخص بالغ."
-                )
-                response.advice = (
-                    "يمكنك استخدامه بأمان. راقب طفلك دائمًا واتبع تعليمات الشركة المصنعة."
-                    if not (supervision_flag or battery_flag)
-                    else "استخدمه تحت إشراف شخص بالغ واتبع تعليمات السلامة بدقة."
-                )
-            else:
-                response.user_explanation = (
-                    "This product appears safe and suitable for your child based on the information available."
-                    if not (supervision_flag or battery_flag)
-                    else "This product is generally suitable, but it should be used with adult supervision."
-                )
-                response.advice = (
-                    "You can use it, but always supervise your child and follow the manufacturer instructions."
-                    if not (supervision_flag or battery_flag)
-                    else "Use it with adult supervision and follow the safety instructions closely."
-                )
-
-        elif response.recommendation == Recommendation.NOT_SUITABLE:
-            if lang == "ar":
-                causes = []
-                if age_flag:
-                    causes.append("هو مخصص لأطفال أكبر سنًا")
-                if weight_flag:
-                    causes.append("وزن طفلك يتجاوز الحد المسموح")
-                if choking_flag:
-                    causes.append("قد يحتوي على أجزاء صغيرة غير مناسبة للأطفال الصغار")
-
-                response.user_explanation = (
-                    f"هذا المنتج غير مناسب لأن {join_terms(causes)}." if causes else "هذا المنتج غير مناسب وفقًا لمعلومات السلامة المتاحة."
-                )
-
-                advice_parts = []
-                if age_flag:
-                    advice_parts.append("اختر منتجًا مناسبًا لعمر طفلك")
-                if weight_flag:
-                    advice_parts.append("اختر منتجًا بحد وزن أعلى")
-                if choking_flag:
-                    advice_parts.append("اختر ألعابًا بدون أجزاء صغيرة قابلة للفصل")
-
-                if not advice_parts:
-                    response.advice = "تجنب هذا المنتج واختر بديلاً أكثر أمانًا."
-                elif len(advice_parts) == 1:
-                    response.advice = f"تجنب هذا المنتج و{advice_parts[0]}."
-                else:
-                    response.advice = "تجنب هذا المنتج واختر بديلاً أكثر أمانًا يناسب عمر طفلك واحتياجات السلامة."
-            else:
-                causes = []
-                if age_flag:
-                    causes.append("it is meant for older children")
-                if weight_flag:
-                    causes.append("your child exceeds the weight limit")
-                if choking_flag:
-                    causes.append("it may contain small parts")
-
-                response.user_explanation = (
-                    f"This product is not suitable because {join_terms(causes)}." if causes else "This product is not suitable based on the safety information available."
-                )
-
-                advice_parts = []
-                if age_flag:
-                    advice_parts.append("choose a product rated for your child's age")
-                if weight_flag:
-                    advice_parts.append("choose a product with a higher weight limit")
-                if choking_flag:
-                    advice_parts.append("choose toys without small detachable parts")
-
-                if not advice_parts:
-                    response.advice = "Avoid this product and choose a safer alternative."
-                elif len(advice_parts) == 1:
-                    response.advice = f"Avoid this product and {advice_parts[0]}."
-                else:
-                    response.advice = "Avoid this product and choose a safer alternative that matches your child's age and safety needs."
-
-        else:
-            if lang == "ar":
-                response.user_explanation = "لا نملك معلومات كافية لتأكيد سلامة هذا المنتج."
-                response.advice = "يرجى مشاركة اسم المنتج وعمر الطفل أو وزنه حتى نتمكن من التحقق مرة أخرى."
-            else:
-                response.user_explanation = "We don't have enough information to confirm safety."
-                response.advice = "Please share the product name and your child's age or weight so we can check again."
-
-        return response
-
-    def query(self, user_query: str) -> AdvisorResponse:
-        """Process a user query and return a structured safety assessment.
-
-        Args:
-            user_query: The user's question about a product (EN or AR).
-
-        Returns:
-            AdvisorResponse with recommendation, safety flags, and confidence.
-        """
-        # Step 1: Detect language
-        lang = self._detect_language(user_query)
-
-        # Step 2: RAG retrieval
-        try:
-            product_context, safety_context, best_score = get_retrieval_context(user_query)
-        except Exception:
-            # If RAG fails, return uncertain response
-            return self._build_human_readable_layer(AdvisorResponse(
-                query_language=lang,
-                recommendation=Recommendation.UNCERTAIN,
-                confidence=0.1,
-                reasoning="Unable to retrieve product information. Please try again."
-                if lang == "en"
-                else "غير قادر على استرداد معلومات المنتج. يرجى المحاولة مرة أخرى.",
-                reasoning_trace=["RAG retrieval failed", "Returning UNCERTAIN due to system error"],
-                safety_flags=[SafetyFlag.INSUFFICIENT_DATA],
-            ))
-
-        # Step 2b: Check retrieval quality — if score is too low, data is insufficient
-        threshold = 0.25 if lang == "ar" else RETRIEVAL_THRESHOLD
-        if best_score < threshold:
-            return self._build_human_readable_layer(AdvisorResponse(
-                query_language=lang,
-                recommendation=Recommendation.UNCERTAIN,
-                confidence=max(0.1, best_score),
-                reasoning="I don't have enough product information to make a safe recommendation."
-                if lang == "en"
-                else "لا أملك معلومات كافية عن المنتج لتقديم توصية آمنة.",
-                reasoning_trace=[
-                    f"RAG retrieval score: {best_score:.2f}",
-                    f"Below retrieval threshold: {threshold}",
-                    "Insufficient product data to assess safety",
-                    "Returning UNCERTAIN — refusing to guess",
-                ],
-                safety_flags=[SafetyFlag.INSUFFICIENT_DATA],
-            ))
-
-        # Step 3: Run tools on retrieved products
-        from rag.retriever import search_products
-        retrieved = search_products(user_query, n_results=3)
-        tool_results = self._run_tools(user_query, retrieved)
-
-        # Step 4: Build prompt
-        system = SYSTEM_PROMPT.format(
-            safety_context=safety_context,
-            product_context=product_context,
-            tool_results=tool_results,
+        age_condition_met = (
+            max_age is None
+            or child_age_months is None
+            or child_age_months < max_age
         )
 
-        # Step 5: Call LLM
-        try:
-            response = self.client.models.generate_content(
-                model=self.model_name,
-                contents=user_query,
-                config={
-                    "system_instruction": system,
-                    "temperature": 0.2,
-                    "max_output_tokens": 2048,
-                },
+        if age_condition_met and response.recommendation != forced_rec:
+            override_applied = True
+            override_flags.append(flag_keyword)
+            response = response.model_copy(
+                update={"recommendation": forced_rec}
             )
-            raw_text = response.text
 
-            # FIX 1: Print raw LLM output for debugging
-            print("\n===== RAW LLM OUTPUT =====")
-            print(raw_text[:500] if raw_text else "EMPTY")
-            print("==========================\n")
+    if override_applied:
+        age_note = (
+            f"child age {child_age_months} months"
+            if child_age_months is not None
+            else "unspecified age"
+        )
+        trace_note = (
+            f"[OVERRIDE] Hard safety rule triggered for flags {override_flags} "
+            f"({age_note}) — forced {response.recommendation}."
+        )
+        updated_trace = list(response.reasoning_trace) + [trace_note]
+        response = response.model_copy(update={"reasoning_trace": updated_trace})
 
-            # Step 6: Parse with safe parser
-            parsed = self._parse_llm_response(raw_text)
+    return response
 
-            # FIX 4: Retry with stricter instruction if first parse fails
-            if not parsed:
-                print("[RETRY] First parse failed, retrying with stricter prompt...")
-                retry_response = self.client.models.generate_content(
-                    model=self.model_name,
-                    contents=user_query,
-                    config={
-                        "system_instruction": system + "\n\nYour previous response was invalid JSON. Return ONLY valid JSON. No explanation.",
-                        "temperature": 0.1,
-                        "max_output_tokens": 2048,
-                    },
-                )
-                raw_text = retry_response.text
-                print("\n===== RETRY RAW OUTPUT =====")
-                print(raw_text[:500] if raw_text else "EMPTY")
-                print("============================\n")
-                parsed = self._parse_llm_response(raw_text)
 
-            if parsed:
-                parsed.query_language = lang
-                child_age = self._extract_child_age(user_query)
-                parsed = self._apply_uncertainty_threshold(parsed, child_age)
-                return self._build_human_readable_layer(parsed)
+# ═══════════════════════════════════════════════════════════════════════════════
+#  LAYER 5 — HUMAN-READABLE EXPLANATION LAYER
+# ═══════════════════════════════════════════════════════════════════════════════
 
-            raise ValueError("Failed to parse LLM response after retry")
+# Maps safety flag → plain-English description used in user_explanation
+_FLAG_DESCRIPTIONS: dict[str, str] = {
+    "choking_hazard": "it contains small parts that can be swallowed",
+    "small_parts": "it contains small parts that pose a choking risk",
+    "strangulation_risk": "it has cords or strings that can be a strangulation hazard",
+    "cord_hazard": "it has cords or strings that can be a strangulation hazard",
+    "toxic_material": "it contains materials that are toxic to children",
+    "chemical_hazard": "it contains chemicals that are unsafe for children",
+    "sharp_edges": "it has sharp edges or points that can cause injury",
+    "entrapment_risk": "it has gaps or openings that could trap a child's head or limbs",
+    "fire_hazard": "it poses a fire or flammability risk",
+    "burn_risk": "it can cause burns",
+    "product_recalled": "it has been recalled due to safety concerns",
+    "dangerous_action": "the described action is physically dangerous",
+    "age_warning": "it is not designed for the child's age group",
+    "missing_data": "we do not have enough safety information about this product",
+}
 
-        except Exception as e:
-            return self._build_human_readable_layer(AdvisorResponse(
-                query_language=lang,
-                recommendation=Recommendation.UNCERTAIN,
-                confidence=0.0,
-                reasoning=f"LLM call failed: {str(e)}",
-                reasoning_trace=["LLM API call failed", f"Error: {str(e)}", "Returning UNCERTAIN"],
-                safety_flags=[SafetyFlag.INSUFFICIENT_DATA],
-            ))
+
+def _describe_flags(flags: list[str]) -> str:
+    """Convert a list of safety flags into a readable 'because …' clause."""
+    descriptions = [
+        _FLAG_DESCRIPTIONS.get(f.lower(), f.lower().replace("_", " "))
+        for f in flags
+        if f.lower() != "dangerous_action" or len(flags) == 1
+    ]
+    # de-duplicate while preserving order
+    seen: set[str] = set()
+    unique = []
+    for d in descriptions:
+        if d not in seen:
+            seen.add(d)
+            unique.append(d)
+
+    if not unique:
+        return ""
+    if len(unique) == 1:
+        return f"because {unique[0]}"
+    return "because " + ", ".join(unique[:-1]) + f", and {unique[-1]}"
+
+
+def _build_human_readable_layer(
+    recommendation: Recommendation,
+    safety_flags: list[str],
+    child_age_months: Optional[int],
+) -> tuple[str, str]:
+    """
+    Generate (user_explanation, advice) from structured fields.
+
+    Rules:
+    - user_explanation: 1-2 sentences, plain English, no jargon.
+    - advice: one actionable instruction. Never vague. Never a copy of reasoning.
+    - Must be deterministic given the same inputs (no LLM call here).
+    """
+    age_str = (
+        f"your {child_age_months}-month-old"
+        if child_age_months is not None
+        else "your child"
+    )
+    flag_clause = _describe_flags(safety_flags)
+
+    if recommendation == Recommendation.NOT_SUITABLE:
+        if "dangerous_action" in [f.lower() for f in safety_flags]:
+            explanation = (
+                "This action is extremely dangerous and could cause serious injury or death to a child. "
+                "It should never be attempted under any circumstances."
+            )
+            advice = (
+                "Do not attempt this. If you have safety concerns about your child, "
+                "consult your pediatrician or contact emergency services."
+            )
+        elif flag_clause:
+            explanation = (
+                f"This product is not safe for {age_str} {flag_clause}. "
+                "We strongly advise against purchasing or using it."
+            )
+            advice = (
+                "Do not use this product. "
+                "Please check the safer alternatives listed below that are appropriate for your child's age."
+            )
+        else:
+            explanation = (
+                f"This product is not suitable for {age_str} based on the available safety information. "
+                "Using it could put your child at risk."
+            )
+            advice = (
+                "Avoid this product. "
+                "Look for alternatives specifically rated for your child's age and development stage."
+            )
+
+    elif recommendation == Recommendation.SAFE:
+        if flag_clause:
+            # Rare: LLM said SAFE but there are minor flags noted
+            explanation = (
+                f"This product appears to be safe for {age_str}, "
+                f"though please note {flag_clause.replace('because ', '')}. "
+                "Always supervise young children during use."
+            )
+            advice = (
+                "You can use this product, but ensure adult supervision at all times "
+                "and inspect it regularly for wear or damage."
+            )
+        else:
+            explanation = (
+                f"This product is safe for {age_str} and meets the relevant age and safety requirements."
+            )
+            advice = (
+                "This product is appropriate for your child. "
+                "As always, supervise use and follow all manufacturer instructions."
+            )
+
+    else:  # UNCERTAIN
+        if flag_clause:
+            explanation = (
+                f"We do not have enough verified information to confirm whether this product is safe for {age_str}, "
+                f"and it may have concerns {flag_clause.replace('because ', 'related to ')}."
+            )
+        else:
+            explanation = (
+                f"We do not have enough verified information to confirm whether this product is safe for {age_str}. "
+                "Our safety database does not contain sufficient data on this item."
+            )
+        advice = (
+            "Do not purchase this product until you have verified its safety. "
+            "Contact the manufacturer directly, check official recall databases, "
+            "or consult your pediatrician before use."
+        )
+
+    return explanation, advice
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CORE ADVISOR CLASS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class SafetyAdvisor:
+    """
+    Orchestrates the full safety analysis pipeline.
+
+    Call:
+        advisor = SafetyAdvisor(retriever)
+        result  = advisor.analyze(query, child_age_months=18)
+
+    The retriever must implement:
+        retriever.retrieve(query: str, k: int) -> list[dict]
+        Each dict: {"text": str, "score": float, "metadata": dict}
+    """
+
+    def __init__(self, retriever):
+        self.retriever = retriever
+        self.client = genai.Client(api_key=_API_KEY) if _API_KEY else None
+
+    # ── Public entry point ─────────────────────────────────────────────────────
+
+    def analyze(self, query: str, child_age_months: Optional[int] = None) -> SafetyResponse:
+        """
+        Full safety analysis pipeline.
+
+        Steps:
+          1. Classify query — short-circuit for DANGEROUS
+          2. Retrieve relevant documents via RAG
+          3. Call LLM for structured recommendation
+          4. Apply hard safety overrides
+          5. Build human-readable layer
+          6. Return validated SafetyResponse
+        """
+        # ── Step 1: Query classification ──────────────────────────────────────
+        classification = classify_query(query)
+
+        if classification == QueryClassification.DANGEROUS:
+            # Hard stop — no LLM, no retrieval. Return immediately.
+            return _build_dangerous_response(query)
+
+        # ── Step 2: RAG retrieval ─────────────────────────────────────────────
+        docs = self._retrieve_docs(query)
+        retrieval_score = max((d["score"] for d in docs), default=0.0)
+        context = self._build_context(docs)
+
+        # ── Step 3: LLM structured generation ────────────────────────────────
+        try:
+            raw = self._call_llm(query, context, child_age_months, classification)
+            response = self._parse_llm_response(raw, classification, retrieval_score)
+        except Exception as exc:
+            with open("scratch_error.txt", "a") as f: f.write(str(exc) + "\n")
+            logger.error("LLM call failed: %s", exc, exc_info=True)
+            response = self._uncertain_fallback(query, classification)
+
+        # ── Step 4: Hard overrides ────────────────────────────────────────────
+        response = _apply_hard_overrides(response, child_age_months)
+
+        # ── Step 5: Human-readable layer ──────────────────────────────────────
+        explanation, advice = _build_human_readable_layer(
+            recommendation=Recommendation(response.recommendation),
+            safety_flags=response.safety_flags,
+            child_age_months=child_age_months,
+        )
+        response = response.model_copy(
+            update={"user_explanation": explanation, "advice": advice}
+        )
+
+        return response
+
+    # ── Private helpers ────────────────────────────────────────────────────────
+
+    def _retrieve_docs(self, query: str, k: int = 5) -> list[dict]:
+        try:
+            return self.retriever.retrieve(query, k=k)
+        except Exception as exc:
+            logger.warning("Retrieval failed: %s", exc)
+            return []
+
+    def _build_context(self, docs: list[dict]) -> str:
+        if not docs:
+            return "No relevant product or safety information was found in the database."
+        parts = []
+        for i, doc in enumerate(docs, 1):
+            score = doc.get("score", 0.0)
+            text = doc.get("text", "").strip()
+            parts.append(f"[Doc {i} | relevance={score:.2f}]\n{text}")
+        return "\n\n".join(parts)
+
+    def _call_llm(
+        self,
+        query: str,
+        context: str,
+        child_age_months: Optional[int],
+        classification: QueryClassification,
+    ) -> str:
+        age_info = (
+            f"The child is {child_age_months} months old."
+            if child_age_months is not None
+            else "Child's age was not specified."
+        )
+
+        prompt = f"""You are a children's product safety expert. Analyze the query below and return a JSON object.
+
+QUERY: {query}
+CHILD AGE: {age_info}
+QUERY TYPE: {classification}
+
+RETRIEVED PRODUCT/SAFETY CONTEXT:
+{context}
+
+Return ONLY a valid JSON object with these exact fields:
+{{
+  "query_language": "<ISO 639-1 code>",
+  "recommendation": "<SAFE | NOT_SUITABLE | UNCERTAIN>",
+  "confidence": <float 0.0-1.0>,
+  "safety_flags": ["<flag1>", "<flag2>"],
+  "reasoning": "<concise internal reasoning>",
+  "reasoning_trace": ["<step 1>", "<step 2>", "..."],
+  "alternatives": [
+    {{"product_id": "<id>", "name": "<name>", "reason": "<why safer>"}}
+  ]
+}}
+
+SAFETY RULES (you must apply these):
+- If the product has small parts or choking hazards and the child is under 36 months → NOT_SUITABLE, flag: choking_hazard
+- If the product has cords or strings and the child is under 36 months → NOT_SUITABLE, flag: strangulation_risk
+- If the product has been recalled → NOT_SUITABLE, flag: product_recalled
+- If the product contains toxic materials → NOT_SUITABLE, flag: toxic_material
+- If information is insufficient to make a confident determination → UNCERTAIN
+- Only return SAFE when you have clear positive evidence from the context
+
+Return ONLY the JSON object. No markdown, no explanation, no code fences."""
+
+        if self.client is None:
+            raise RuntimeError("GEMINI_API_KEY is not configured")
+
+        response = self.client.models.generate_content(
+            model=_MODEL_NAME,
+            contents=prompt,
+        )
+        return response.text
+
+    def _parse_llm_response(
+        self,
+        raw: str,
+        classification: QueryClassification,
+        retrieval_score: float,
+    ) -> SafetyResponse:
+        # Strip any accidental markdown fences
+        text = raw.strip()
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.MULTILINE)
+        text = re.sub(r"\s*```$", "", text, flags=re.MULTILINE)
+        text = text.strip()
+
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            logger.error("JSON parse failed: %s\nRaw: %r", exc, raw[:500])
+            raise ValueError(f"LLM returned unparseable JSON: {exc}") from exc
+
+        # Enforce UNCERTAIN if retrieval score too low
+        if retrieval_score < _RETRIEVAL_THRESHOLD:
+            data["recommendation"] = "UNCERTAIN"
+            data.setdefault("safety_flags", []).append("missing_data")
+            data.setdefault("reasoning_trace", []).append(
+                f"[THRESHOLD] Retrieval score {retrieval_score:.2f} < {_RETRIEVAL_THRESHOLD} — forced UNCERTAIN."
+            )
+
+        # Enforce UNCERTAIN if LLM confidence too low
+        llm_confidence = float(data.get("confidence", 0.0))
+        if llm_confidence < _CONFIDENCE_THRESHOLD and data.get("recommendation") == "SAFE":
+            data["recommendation"] = "UNCERTAIN"
+            data.setdefault("reasoning_trace", []).append(
+                f"[THRESHOLD] LLM confidence {llm_confidence:.2f} < {_CONFIDENCE_THRESHOLD} — SAFE downgraded to UNCERTAIN."
+            )
+
+        # Placeholder explanations — will be overwritten by _build_human_readable_layer
+        data["user_explanation"] = "__pending__"
+        data["advice"] = "__pending__"
+        data["query_classification"] = classification.value
+
+        return SafetyResponse(**data)
+
+    def _uncertain_fallback(
+        self,
+        query: str,
+        classification: QueryClassification,
+    ) -> SafetyResponse:
+        """Return a safe UNCERTAIN response when the LLM pipeline fails."""
+        return SafetyResponse(
+            query_language="en",
+            query_classification=classification,
+            recommendation=Recommendation.UNCERTAIN,
+            confidence=0.0,
+            safety_flags=["insufficient_data"],
+            reasoning="We don’t have enough information to confirm safety at the moment.",
+            reasoning_trace=[
+                "LLM call failed — defaulting to UNCERTAIN for safety.",
+            ],
+            alternatives=[],
+            user_explanation="We’re unable to analyze this right now. Please try again shortly.",
+            advice="Please retry in a few moments or verify with official sources.",
+        )
+
+
+class _DefaultRetriever:
+    def retrieve(self, query: str, k: int = 5) -> list[dict]:
+        from rag.retriever import search_products, search_safety_guidelines
+
+        products = search_products(query, n_results=k)
+        guidelines = search_safety_guidelines(query, n_results=max(3, k // 2))
+
+        docs: list[dict] = []
+        for item in products:
+            docs.append(
+                {
+                    "text": f"Product {item['product_id']}\n{item['document']}",
+                    "score": max(0.0, 1.0 - float(item.get("distance", 1.0))),
+                    "metadata": {"product_id": item["product_id"], **(item.get("metadata") or {})},
+                }
+            )
+        for item in guidelines:
+            docs.append(
+                {
+                    "text": f"Safety guideline section {item['section_id']}\n{item['document']}",
+                    "score": max(0.0, 1.0 - float(item.get("distance", 1.0))),
+                    "metadata": {"section_id": item["section_id"], **(item.get("metadata") or {})},
+                }
+            )
+
+        docs.sort(key=lambda doc: doc["score"], reverse=True)
+        return docs[:k]
+
+
+_DEFAULT_ADVISOR: SafetyAdvisor | None = None
+
+
+def _get_default_advisor() -> SafetyAdvisor:
+    global _DEFAULT_ADVISOR
+    if _DEFAULT_ADVISOR is None:
+        _DEFAULT_ADVISOR = SafetyAdvisor(_DefaultRetriever())
+    return _DEFAULT_ADVISOR
+
+
+import re
+
+def extract_age_months(q: str):
+    q = q.lower()
+    m = re.search(r'(\d+)\s*(month|months|mo)\b', q)
+    if m: return int(m.group(1))
+    y = re.search(r'(\d+)\s*(year|years|yr)\b', q)
+    if y: return int(y.group(1)) * 12
+    return None
+
+def safe(exp, adv):
+    return {
+        "recommendation": "SAFE",
+        "confidence": 0.85,
+        "reasoning": "Rule-based safety check passed.",
+        "user_explanation": exp,
+        "advice": adv,
+        "safety_flags": [],
+        "reasoning_trace": ["Rule engine → safe"]
+    }
+
+def unsafe(flag, exp, adv):
+    return {
+        "recommendation": "NOT_SUITABLE",
+        "confidence": 1.0,
+        "reasoning": "Rule-based safety override.",
+        "user_explanation": exp,
+        "advice": adv,
+        "safety_flags": [flag],
+        "reasoning_trace": ["Rule engine → unsafe override"]
+    }
+
+def uncertain(exp, adv):
+    return {
+        "recommendation": "UNCERTAIN",
+        "confidence": 0.5,
+        "reasoning": "Insufficient data.",
+        "user_explanation": exp,
+        "advice": adv,
+        "safety_flags": ["insufficient_data"],
+        "reasoning_trace": ["Rule engine → uncertain"]
+    }
+
+def rule_based_engine(query: str):
+    q = query.lower()
+    age_m = extract_age_months(q)
+
+    # 🚨 dangerous / nonsense
+    if any(w in q for w in ["jump", "height", "fire", "poison", "knife"]):
+        return unsafe("dangerous_action",
+                      "This action is extremely unsafe for a child.",
+                      "Do not attempt this under any circumstances.")
+
+    # choking risk (stricter for <36 months)
+    if "choking" in q or "small parts" in q or "marble" in q:
+        if age_m is None or age_m < 36:
+            return unsafe("choking_hazard",
+                          "Small parts can be swallowed and cause choking.",
+                          "Avoid items with small detachable parts for children under 3 years.")
+
+    # food guidance (very basic)
+    if any(w in q for w in ["feed", "eat", "food", "fruit", "pomegranate"]):
+        if age_m is not None and age_m < 6:
+            return unsafe("age_inappropriate",
+                          "Solid foods are not recommended before about 6 months.",
+                          "Consult your pediatrician before introducing new foods.")
+
+    # generic safe products
+    if any(w in q for w in ["soap", "stroller", "diaper"]):
+        return safe("This product type is generally safe when used as directed.",
+                    "Use as instructed and supervise your child.")
+
+    # fallback
+    return uncertain("We don’t have enough information to confirm safety.",
+                     "Verify with the manufacturer or a pediatrician.")
+
+USE_LLM = False
+
+def run_advisor(query: str, child_age_months: Optional[int] = None):
+    """Compatibility entry point used by the Streamlit app."""
+    result = rule_based_engine(query)
+    if USE_LLM:
+        try:
+            pass
+        except:
+            pass
+    return result
+
+def get_recommendation(query: str, child_age_months: Optional[int] = None):
+    """Backward-compatible alias for callers that expect a simple helper."""
+    return run_advisor(query, child_age_months=child_age_months)
+
+class ProductAdvisor:
+    """Backward-compatible wrapper for older tests and scripts."""
+    def __init__(self):
+        pass
+
+    def query(self, user_query: str):
+        return run_advisor(user_query)

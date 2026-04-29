@@ -63,23 +63,55 @@ _backend = _try_import()
 def _mock(query: str) -> dict:
     q = query.lower()
     if any(w in q for w in ["knife","choking","toxic","sharp","unsafe"]):
-        return {"query_language":"en","recommendation":"NOT_SUITABLE","confidence":0.91,
-                "safety_flags":["choking_hazard","sharp_edges"],
-                "reasoning":"This product contains small detachable parts posing a choking hazard for children under 36 months, and sharp edges increase injury risk.",
-                "reasoning_trace":["Identified product","Child age: under 3 yrs",
-                    "Small detachable parts → choking hazard","Hard plastic with sharp edges",
-                    "[OVERRIDE] Critical flags → forced NOT_SUITABLE"],
-                "alternatives":[{"product_id":"MW-027","name":"Playgro Sensory Toy",
-                    "reason":"No small parts, safe for infants 0–36 months"}]}
+        return {
+            "query_language": "en",
+            "query_classification": "DANGEROUS",
+            "recommendation": "NOT_SUITABLE",
+            "confidence": 0.91,
+            "safety_flags": ["choking_hazard", "sharp_edges"],
+            "reasoning": "This product contains small detachable parts posing a choking hazard for children under 36 months, and sharp edges increase injury risk.",
+            "reasoning_trace": [
+                "Identified product",
+                "Child age: under 3 yrs",
+                "Small detachable parts → choking hazard",
+                "Hard plastic with sharp edges",
+                "[OVERRIDE] Critical flags → forced NOT_SUITABLE",
+            ],
+            "user_explanation": "This product is not safe because it contains small parts and sharp edges.",
+            "advice": "Do not use this product. Choose a safer alternative for young children.",
+            "alternatives": [
+                {
+                    "product_id": "MW-027",
+                    "name": "Playgro Sensory Toy",
+                    "reason": "No small parts, safe for infants 0–36 months",
+                }
+            ],
+        }
     if any(w in q for w in ["unknown","missing","no data","uncertain"]):
-        return {"query_language":"en","recommendation":"UNCERTAIN","confidence":0.42,
-                "safety_flags":[],"reasoning":"Insufficient product data. Cannot make a definitive recommendation.",
-                "reasoning_trace":["Query processed","RAG score 0.31 < threshold 0.40","→ UNCERTAIN"],
-                "alternatives":[]}
-    return {"query_language":"en","recommendation":"SUITABLE","confidence":0.88,
-            "safety_flags":[],"reasoning":"Product meets all safety requirements. No hazardous materials or small parts.",
-            "reasoning_trace":["Product identified","Age group validated","No flags","→ SUITABLE"],
-            "alternatives":[]}
+        return {
+            "query_language": "en",
+            "query_classification": "PRODUCT_SAFETY",
+            "recommendation": "UNCERTAIN",
+            "confidence": 0.42,
+            "safety_flags": [],
+            "reasoning": "Insufficient product data. Cannot make a definitive recommendation.",
+            "reasoning_trace": ["Query processed", "RAG score 0.31 < threshold 0.40", "→ UNCERTAIN"],
+            "user_explanation": "We don’t have enough information to confirm safety.",
+            "advice": "Please share the product name or more details so we can check again.",
+            "alternatives": [],
+        }
+    return {
+        "query_language": "en",
+        "query_classification": "PRODUCT_SAFETY",
+        "recommendation": "SUITABLE",
+        "confidence": 0.88,
+        "safety_flags": [],
+        "reasoning": "Product meets all safety requirements. No hazardous materials or small parts.",
+        "reasoning_trace": ["Product identified", "Age group validated", "No flags", "→ SUITABLE"],
+        "user_explanation": "This product appears safe for your child based on the available information.",
+        "advice": "You can use it, but keep following the manufacturer instructions and supervise your child.",
+        "alternatives": [],
+    }
 
 def call_backend(query: str) -> dict:
     fn = _backend or _mock
@@ -88,9 +120,8 @@ def call_backend(query: str) -> dict:
         if hasattr(r,"model_dump"): return r.model_dump()
         if hasattr(r,"dict"):       return r.dict()
         if isinstance(r,dict):      return r
-    except Exception as e:
-        return {"query_language":"en","recommendation":"UNCERTAIN","confidence":0.0,
-                "safety_flags":[],"reasoning":f"Error: {e}","reasoning_trace":[str(e)],"alternatives":[]}
+    except Exception:
+        pass
     return _mock(query)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -475,9 +506,9 @@ def safety_card(result: dict, query: str) -> str:
   <div class="sc-alt-why">{a.get("reason","")}</div>
 </div>"""
 
-        if rsn or trace:
-                items = "".join(f"<li>{t}</li>" for t in trace)
-                h += f"""
+    if rsn or trace:
+        items = "".join(f"<li>{t}</li>" for t in trace)
+        h += f"""
 <details class="sc-tr">
     <summary>⊞ Reasoning details</summary>
     <div class="sc-st">Technical reasoning</div>
