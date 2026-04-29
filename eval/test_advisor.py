@@ -3,6 +3,7 @@
 import json
 import sys
 import pytest
+import time
 from pathlib import Path
 
 # Add project root to path
@@ -45,6 +46,7 @@ def case_id(case):
 @pytest.mark.parametrize("case", TEST_CASES, ids=case_id)
 def test_advisor_response(advisor, case, all_results):
     """Test the advisor's response against expected values."""
+    time.sleep(13)  # Bypass 5 RPM rate limit
     result = {"id": case["id"], "category": case.get("category", "unknown")}
 
     # Query the advisor

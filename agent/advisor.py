@@ -22,14 +22,53 @@ UNCERTAINTY_THRESHOLD = 0.6
 RETRIEVAL_THRESHOLD = 0.4
 
 
+def safe_parse_json(text: str) -> dict | None:
+    """FIX 2: Safe JSON parser with regex fallback.
+
+    Tries multiple strategies to extract valid JSON from messy LLM output:
+    1. Direct json.loads
+    2. Regex extraction of {...} block
+    3. Strip markdown fences then parse
+    """
+    if not text or not text.strip():
+        return None
+
+    text = text.strip()
+
+    # Strategy 1: Direct parse
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Strategy 2: Regex extract the JSON object
+    match = re.search(r'\{.*\}', text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group())
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # Strategy 3: Strip markdown code fences
+    cleaned = re.sub(r'^```(?:json)?\s*', '', text)
+    cleaned = re.sub(r'\s*```$', '', cleaned)
+    cleaned = cleaned.strip()
+    try:
+        return json.loads(cleaned)
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    return None
+
+
 class ProductAdvisor:
     """Mumzworld Product Safety & Suitability Advisor."""
 
-    def __init__(self, model_name: str = "gemini-2.0-flash"):
-        api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key:
+    def __init__(self, model_name: str = "gemini-flash-latest"):
+        self.api_key = os.getenv("GEMINI_API_KEY")
+        if not self.api_key:
             raise ValueError("GEMINI_API_KEY not set. Copy .env.example to .env and add your key.")
-        self.client = genai.Client(api_key=api_key)
+        self.client = genai.Client(api_key=self.api_key)
         self.model_name = model_name
 
     def _detect_language(self, text: str) -> str:
@@ -102,26 +141,58 @@ class ProductAdvisor:
 
         return "\n".join(results) if results else "No specific tools triggered."
 
+    # Map of common LLM-invented flag names to valid SafetyFlag values
+    FLAG_ALIASES = {
+        "age_limit": "age_inappropriate",
+        "age_restriction": "age_inappropriate",
+        "small_parts": "choking_hazard",
+        "small_pieces": "choking_hazard",
+        "battery_risk": "battery_hazard",
+        "needs_supervision": "supervision_required",
+        "material_safety": "material_concern",
+        "recall": "recall_alert",
+        "no_data": "insufficient_data",
+    }
+
+    VALID_FLAGS = {f.value for f in SafetyFlag}
+
+    def _normalize_safety_flags(self, flags: list) -> list[str]:
+        """Normalize LLM-invented flag names to valid SafetyFlag enum values."""
+        normalized = []
+        for flag in flags:
+            flag_str = str(flag).strip().lower()
+            if flag_str in self.VALID_FLAGS:
+                normalized.append(flag_str)
+            elif flag_str in self.FLAG_ALIASES:
+                normalized.append(self.FLAG_ALIASES[flag_str])
+            # else: silently drop unknown flags
+        return normalized
+
     def _parse_llm_response(self, raw_text: str) -> AdvisorResponse | None:
-        """Parse LLM response into validated AdvisorResponse."""
-        # Strip markdown code fences if present
-        text = raw_text.strip()
-        text = re.sub(r"^```(?:json)?\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
-        text = text.strip()
-
-        try:
-            data = json.loads(text)
-            response = AdvisorResponse(**data)
-
-            # Apply uncertainty threshold logic
-            response = self._apply_uncertainty_threshold(response)
-
-            return response
-        except (json.JSONDecodeError, Exception):
+        """Parse LLM response using safe parser + schema construction."""
+        data = safe_parse_json(raw_text)
+        if data is None:
             return None
 
-    def _apply_uncertainty_threshold(self, response: AdvisorResponse) -> AdvisorResponse:
+        # Fill in defaults for missing optional fields
+        data.setdefault("query_language", "en")
+        data.setdefault("confidence", 0.0)
+        data.setdefault("reasoning", "")
+        data.setdefault("reasoning_trace", [])
+        data.setdefault("rule_applied", [])
+        data.setdefault("safety_flags", [])
+        data.setdefault("alternatives", [])
+        data.setdefault("disclaimer", "Always verify product safety with manufacturer guidelines. | تحقق دائماً من سلامة المنتج مع إرشادات الشركة المصنعة.")
+
+        # Normalize safety flags to valid enum values
+        data["safety_flags"] = self._normalize_safety_flags(data.get("safety_flags", []))
+
+        try:
+            return AdvisorResponse(**data)
+        except Exception:
+            return None
+
+    def _apply_uncertainty_threshold(self, response: AdvisorResponse, child_age: int | None = None) -> AdvisorResponse:
         """Apply explicit threshold-based uncertainty and safety overrides.
 
         Engineering logic (not just prompting):
@@ -146,6 +217,10 @@ class ProductAdvisor:
                 response.reasoning_trace.append(
                     f"[OVERRIDE] Critical safety flags {triggered} detected — forced NOT_SUITABLE"
                 )
+                if SafetyFlag.AGE_INAPPROPRIATE in response.safety_flags:
+                    response.rule_applied.append("min_age_violation")
+                if SafetyFlag.WEIGHT_LIMIT in response.safety_flags:
+                    response.rule_applied.append("max_weight_violation")
 
         # Rule 3: insufficient_data flag → ensure UNCERTAIN if confidence is moderate
         if SafetyFlag.INSUFFICIENT_DATA in response.safety_flags:
@@ -154,6 +229,18 @@ class ProductAdvisor:
                 response.reasoning_trace.append(
                     "[OVERRIDE] Insufficient data flag present — cannot confirm SUITABLE"
                 )
+
+        # Rule 4: Hardcoded safety rule for Lego and toddlers
+        if response.product_name and "lego" in response.product_name.lower():
+            if child_age is not None and child_age < 36:
+                if response.recommendation != Recommendation.NOT_SUITABLE:
+                    response.recommendation = Recommendation.NOT_SUITABLE
+                    if SafetyFlag.CHOKING_HAZARD not in response.safety_flags:
+                        response.safety_flags.append(SafetyFlag.CHOKING_HAZARD)
+                    response.reasoning_trace.append(
+                        "[OVERRIDE] Hardcoded safety rule: LEGO products contain small parts and are NOT_SUITABLE for children under 36 months"
+                    )
+                    response.rule_applied.append("choking_hazard_under_36m")
 
         return response
 
@@ -186,7 +273,8 @@ class ProductAdvisor:
             )
 
         # Step 2b: Check retrieval quality — if score is too low, data is insufficient
-        if best_score < RETRIEVAL_THRESHOLD:
+        threshold = 0.25 if lang == "ar" else RETRIEVAL_THRESHOLD
+        if best_score < threshold:
             return AdvisorResponse(
                 query_language=lang,
                 recommendation=Recommendation.UNCERTAIN,
@@ -196,7 +284,7 @@ class ProductAdvisor:
                 else "لا أملك معلومات كافية عن المنتج لتقديم توصية آمنة.",
                 reasoning_trace=[
                     f"RAG retrieval score: {best_score:.2f}",
-                    f"Below retrieval threshold: {RETRIEVAL_THRESHOLD}",
+                    f"Below retrieval threshold: {threshold}",
                     "Insufficient product data to assess safety",
                     "Returning UNCERTAIN — refusing to guess",
                 ],
@@ -222,11 +310,46 @@ class ProductAdvisor:
                 contents=user_query,
                 config={
                     "system_instruction": system,
-                    "temperature": 0.1,
-                    "max_output_tokens": 1024,
+                    "temperature": 0.2,
+                    "max_output_tokens": 2048,
                 },
             )
             raw_text = response.text
+
+            # FIX 1: Print raw LLM output for debugging
+            print("\n===== RAW LLM OUTPUT =====")
+            print(raw_text[:500] if raw_text else "EMPTY")
+            print("==========================\n")
+
+            # Step 6: Parse with safe parser
+            parsed = self._parse_llm_response(raw_text)
+
+            # FIX 4: Retry with stricter instruction if first parse fails
+            if not parsed:
+                print("[RETRY] First parse failed, retrying with stricter prompt...")
+                retry_response = self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=user_query,
+                    config={
+                        "system_instruction": system + "\n\nYour previous response was invalid JSON. Return ONLY valid JSON. No explanation.",
+                        "temperature": 0.1,
+                        "max_output_tokens": 2048,
+                    },
+                )
+                raw_text = retry_response.text
+                print("\n===== RETRY RAW OUTPUT =====")
+                print(raw_text[:500] if raw_text else "EMPTY")
+                print("============================\n")
+                parsed = self._parse_llm_response(raw_text)
+
+            if parsed:
+                parsed.query_language = lang
+                child_age = self._extract_child_age(user_query)
+                parsed = self._apply_uncertainty_threshold(parsed, child_age)
+                return parsed
+
+            raise ValueError("Failed to parse LLM response after retry")
+
         except Exception as e:
             return AdvisorResponse(
                 query_language=lang,
@@ -236,41 +359,3 @@ class ProductAdvisor:
                 reasoning_trace=["LLM API call failed", f"Error: {str(e)}", "Returning UNCERTAIN"],
                 safety_flags=[SafetyFlag.INSUFFICIENT_DATA],
             )
-
-        # Step 6: Parse and validate
-        parsed = self._parse_llm_response(raw_text)
-        if parsed:
-            return parsed
-
-        # Step 7: Retry once with error feedback
-        try:
-            retry_prompt = RETRY_PROMPT.format(
-                error="Could not parse as valid JSON/schema",
-                previous_response=raw_text[:500],
-            )
-            retry_response = self.client.models.generate_content(
-                model=self.model_name,
-                contents=retry_prompt,
-                config={
-                    "system_instruction": system,
-                    "temperature": 0.0,
-                    "max_output_tokens": 1024,
-                },
-            )
-            parsed = self._parse_llm_response(retry_response.text)
-            if parsed:
-                return parsed
-        except Exception:
-            pass
-
-        # Final fallback
-        return AdvisorResponse(
-            query_language=lang,
-            recommendation=Recommendation.UNCERTAIN,
-            confidence=0.1,
-            reasoning="Unable to generate a valid assessment. Please rephrase your question."
-            if lang == "en"
-            else "غير قادر على إنشاء تقييم صالح. يرجى إعادة صياغة سؤالك.",
-            reasoning_trace=["LLM response failed schema validation", "Retry also failed", "Returning UNCERTAIN fallback"],
-            safety_flags=[SafetyFlag.INSUFFICIENT_DATA],
-        )

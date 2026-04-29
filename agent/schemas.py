@@ -39,6 +39,7 @@ class AdvisorResponse(BaseModel):
         default_factory=list,
         description="Step-by-step reasoning trace showing how the decision was made"
     )
+    rule_applied: list[str] = Field(default_factory=list, description="Rules triggered (e.g. min_age_violation)")
     safety_flags: list[SafetyFlag] = Field(default_factory=list)
     age_range_months: Optional[str] = Field(default=None, description="e.g. '6-36'")
     alternatives: list[AlternativeProduct] = Field(default_factory=list)

@@ -6,197 +6,485 @@ import time
 from agent.advisor import ProductAdvisor
 from agent.schemas import Recommendation
 
-# Page config
+# ──────────────────────────────────────────────
+# Page Config
+# ──────────────────────────────────────────────
 st.set_page_config(
-    page_title="Mumzworld Product Advisor",
-    page_icon="🧸",
-    layout="wide",
+    page_title="Mumzworld · AI Product Safety Advisor",
+    page_icon="🛡️",
+    layout="centered",
 )
 
-# Custom CSS — polished, premium feel
+# ──────────────────────────────────────────────
+# CSS — Premium, Mumzworld-inspired design
+# ──────────────────────────────────────────────
 st.markdown("""
 <style>
-    .main-header {
+    /* ── Import Google Font ── */
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
+    /* ── Global ── */
+    html, body, .stApp {
+        font-family: 'Inter', sans-serif;
+    }
+    .stApp {
+        background: linear-gradient(to bottom, #fff5f7, #ffffff) !important;
+    }
+    .block-container {
+        max-width: 700px;
+        padding-top: 2rem;
+    }
+    h1, h2, h3 { color: #111111 !important; }
+    p { color: #555555 !important; }
+
+    /* ── Header ── */
+    .mw-header {
         text-align: center;
-        padding: 1rem 0 0.5rem 0;
+        padding: 2rem 1rem 1rem 1rem;
     }
-    .status-banner {
-        padding: 1.5rem 2rem;
-        border-radius: 16px;
-        margin: 1rem 0;
-        text-align: center;
+    .mw-logo {
+        font-size: 2rem;
+        font-weight: 800;
+        letter-spacing: -0.5px;
+        color: #ff4d6d;
     }
-    .status-safe {
-        background: linear-gradient(135deg, #d4edda 0%, #c3e6cb 100%);
-        border: 2px solid #28a745;
+    .mw-logo span {
+        color: #2d2d2d;
     }
-    .status-unsafe {
-        background: linear-gradient(135deg, #f8d7da 0%, #f5c6cb 100%);
-        border: 2px solid #dc3545;
+    .mw-tagline {
+        font-size: 1.05rem;
+        font-weight: 600;
+        color: #444;
+        margin-top: 4px;
     }
-    .status-uncertain {
-        background: linear-gradient(135deg, #fff3cd 0%, #ffeeba 100%);
-        border: 2px solid #ffc107;
-    }
-    .status-icon {
-        font-size: 3rem;
-        margin-bottom: 0.25rem;
-    }
-    .status-label {
-        font-size: 1.5rem;
-        font-weight: 700;
-        margin: 0;
-    }
-    .status-safe .status-label { color: #155724; }
-    .status-unsafe .status-label { color: #721c24; }
-    .status-uncertain .status-label { color: #856404; }
-    .safety-flag {
-        display: inline-block;
-        padding: 6px 14px;
-        border-radius: 20px;
-        margin: 4px;
+    .mw-subtext {
         font-size: 0.85rem;
+        color: #888;
+        margin-top: 2px;
+    }
+
+    /* ── Card base ── */
+    .mw-card {
+        background: #ffffff;
+        border-radius: 16px;
+        padding: 1.75rem 2rem;
+        margin: 1rem 0;
+        box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+        border: 1px solid #f0e4e8;
+    }
+
+    /* ── Status Banner ── */
+    .mw-status {
+        text-align: center;
+        padding: 2rem 1.5rem;
+        border-radius: 16px;
+        margin: 0.5rem 0 1rem 0;
+    }
+    .mw-status-safe {
+        background: linear-gradient(135deg, #e8f8ee 0%, #d0f0db 100%);
+        border: 1.5px solid #34c759;
+    }
+    .mw-status-unsafe {
+        background: linear-gradient(135deg, #fde8ec 0%, #fcd1d8 100%);
+        border: 1.5px solid #ff3b5c;
+    }
+    .mw-status-uncertain {
+        background: linear-gradient(135deg, #fff8e6 0%, #ffefc2 100%);
+        border: 1.5px solid #f5a623;
+    }
+    .mw-status-icon {
+        font-size: 2.75rem;
+        line-height: 1;
+    }
+    .mw-status-label {
+        font-size: 1.5rem;
+        font-weight: 800;
+        letter-spacing: 1px;
+        margin-top: 6px;
+    }
+    .mw-status-safe .mw-status-label { color: #1b7a3d; }
+    .mw-status-unsafe .mw-status-label { color: #c0172b; }
+    .mw-status-uncertain .mw-status-label { color: #9a6c00; }
+    .mw-status-hint {
+        font-size: 0.82rem;
+        color: #777;
+        margin-top: 4px;
+    }
+
+    /* ── Section titles ── */
+    .mw-section-title {
+        font-size: 0.8rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 1.2px;
+        color: #aaa;
+        margin-bottom: 10px;
+        margin-top: 4px;
+    }
+
+    /* ── Product detail rows ── */
+    .mw-detail-row {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 8px 0;
+        border-bottom: 1px solid #f5f0f2;
+    }
+    .mw-detail-row:last-child { border-bottom: none; }
+    .mw-detail-key {
+        font-size: 0.88rem;
+        color: #888;
+        font-weight: 500;
+    }
+    .mw-detail-val {
+        font-size: 0.92rem;
+        color: #333;
         font-weight: 600;
     }
-    .flag-danger { background-color: #dc3545; color: white; }
-    .flag-warning { background-color: #ffc107; color: #333; }
-    .flag-info { background-color: #17a2b8; color: white; }
-    .trace-step {
-        padding: 8px 12px;
-        margin: 4px 0;
-        border-left: 3px solid #007bff;
-        background-color: #f8f9fa;
-        border-radius: 0 6px 6px 0;
-        font-family: 'Consolas', 'Monaco', monospace;
-        font-size: 0.9rem;
+
+    /* ── Confidence bar ── */
+    .mw-conf-track {
+        width: 100%;
+        height: 8px;
+        background: #eee;
+        border-radius: 4px;
+        margin-top: 6px;
+        overflow: hidden;
     }
-    .trace-override {
-        border-left-color: #dc3545;
-        background-color: #fff5f5;
+    .mw-conf-fill {
+        height: 100%;
+        border-radius: 4px;
+        transition: width 0.6s ease;
     }
-    .confidence-container {
-        margin-top: 8px;
+
+    /* ── Safety flag pills ── */
+    .mw-flags { display: flex; flex-wrap: wrap; gap: 8px; }
+    .mw-flag {
+        display: inline-block;
+        padding: 5px 14px;
+        border-radius: 20px;
+        font-size: 0.78rem;
+        font-weight: 600;
+        letter-spacing: 0.3px;
     }
-    .alt-card {
+    .mw-flag-danger { background: #ffe0e6; color: #c0172b; }
+    .mw-flag-warning { background: #fff3d6; color: #9a6c00; }
+    .mw-flag-info { background: #e0f0ff; color: #1a6fb5; }
+
+    /* ── Rules applied pills ── */
+    .mw-rule {
+        display: inline-block;
+        padding: 4px 12px;
+        border-radius: 12px;
+        font-size: 0.75rem;
+        font-weight: 600;
+        background: #f3e8ff;
+        color: #7c3aed;
+        margin: 3px 4px 3px 0;
+    }
+
+    /* ── Reasoning text ── */
+    .mw-reasoning {
+        font-size: 0.95rem;
+        color: #444;
+        line-height: 1.65;
+    }
+
+    /* ── Trace steps ── */
+    .mw-trace-step {
         padding: 10px 14px;
-        margin: 6px 0;
-        border-radius: 8px;
-        background-color: #e8f5e9;
-        border-left: 3px solid #28a745;
+        margin: 5px 0;
+        border-left: 3px solid #ddd;
+        background: #fafafa;
+        border-radius: 0 8px 8px 0;
+        font-size: 0.84rem;
+        color: #555;
+        line-height: 1.5;
     }
+    .mw-trace-override {
+        border-left-color: #ff3b5c;
+        background: #fff5f6;
+    }
+    .mw-trace-num {
+        font-weight: 700;
+        color: #bbb;
+        margin-right: 6px;
+    }
+
+    /* ── Alternative card ── */
+    .mw-alt {
+        padding: 12px 16px;
+        margin: 6px 0;
+        border-radius: 10px;
+        background: #f0faf3;
+        border: 1px solid #d0f0db;
+    }
+    .mw-alt-name {
+        font-weight: 700;
+        font-size: 0.9rem;
+        color: #333;
+    }
+    .mw-alt-id {
+        font-size: 0.75rem;
+        color: #999;
+        margin-left: 6px;
+    }
+    .mw-alt-reason {
+        font-size: 0.82rem;
+        color: #666;
+        margin-top: 4px;
+    }
+
+    /* ── Disclaimer ── */
+    .mw-disclaimer {
+        font-size: 0.78rem;
+        color: #aaa;
+        text-align: center;
+        padding: 8px 0 0 0;
+        line-height: 1.5;
+    }
+
+    /* ── Streamlit overrides ── */
+    .stTextArea textarea {
+        background-color: #ffffff !important;
+        color: #111111 !important;
+        border: 2px solid #ff4d6d !important;
+        border-radius: 12px !important;
+        padding: 12px !important;
+        font-size: 16px !important;
+    }
+    
+    .stButton > button[kind="primary"] {
+        background-color: #ff4d6d !important;
+        color: white !important;
+        border-radius: 12px !important;
+        font-weight: 600 !important;
+        padding: 0.6rem 1.5rem !important;
+        box-shadow: 0 4px 6px -1px rgba(255, 77, 109, 0.2), 0 2px 4px -1px rgba(255, 77, 109, 0.1) !important;
+    }
+    .stButton > button[kind="primary"]:hover {
+        background-color: #e63e5c !important;
+    }
+    .stButton > button[kind="secondary"] {
+        background-color: #111827 !important;
+        color: white !important;
+        border-radius: 12px !important;
+        border: none !important;
+    }
+    div[data-testid="stExpander"] {
+        border: 1px solid #e5e7eb !important;
+        border-radius: 12px !important;
+        background: #ffffff !important;
+    }
+    .stDivider { margin: 0.75rem 0 !important; }
+    
+    .input-card {
+        background: #ffffff;
+        border-radius: 16px;
+        padding: 1.5rem;
+        box-shadow: 0 4px 15px rgba(0,0,0,0.05);
+        margin-bottom: 2rem;
+    }
+
+    /* ── Example buttons ── */
+    .mw-example-btn {
+        display: inline-block;
+        padding: 8px 16px;
+        border-radius: 20px;
+        border: 1px solid #e8dce0;
+        background: #fff;
+        color: #111111;
+        font-size: 0.85rem;
+        cursor: pointer;
+        margin: 4px;
+        transition: all 0.2s;
+    }
+    .mw-example-btn:hover {
+        border-color: #ff4d6d;
+        color: #ff4d6d;
+        background: #fff5f7;
+    }
+
+    /* Hide Streamlit branding */
+    #MainMenu, footer, header { visibility: hidden; }
 </style>
 """, unsafe_allow_html=True)
 
 
-def get_flag_class(flag: str) -> str:
-    """Map safety flag to CSS class."""
-    danger_flags = {"choking_hazard", "age_inappropriate", "weight_limit", "recall_alert", "battery_hazard"}
-    warning_flags = {"supervision_required", "material_concern"}
-    if flag in danger_flags:
-        return "flag-danger"
-    elif flag in warning_flags:
-        return "flag-warning"
-    return "flag-info"
+# ──────────────────────────────────────────────
+# Helper Functions
+# ──────────────────────────────────────────────
+def get_flag_display(flag_val: str) -> tuple[str, str]:
+    """Return (display_name, css_class) for a safety flag."""
+    danger = {"choking_hazard", "age_inappropriate", "weight_limit", "recall_alert", "battery_hazard"}
+    warning = {"supervision_required", "material_concern"}
+    labels = {
+        "choking_hazard": "Choking Hazard",
+        "age_inappropriate": "Age Inappropriate",
+        "weight_limit": "Weight Limit Exceeded",
+        "recall_alert": "Recall Alert",
+        "battery_hazard": "Battery Hazard",
+        "supervision_required": "Supervision Required",
+        "material_concern": "Material Concern",
+        "insufficient_data": "Insufficient Data",
+    }
+    label = labels.get(flag_val, flag_val.replace("_", " ").title())
+    if flag_val in danger:
+        return label, "mw-flag-danger"
+    elif flag_val in warning:
+        return label, "mw-flag-warning"
+    return label, "mw-flag-info"
+
+
+def conf_color(c: float) -> str:
+    if c >= 0.7:
+        return "#34c759"
+    elif c >= 0.4:
+        return "#f5a623"
+    return "#ff3b5c"
 
 
 def render_response(response):
-    """Render the advisor response with visual status indicators."""
-    # === BIG STATUS BANNER ===
+    """Render the advisor response as a premium result card."""
     rec = response.recommendation
+
+    # ── Status Banner ──
     if rec == Recommendation.SUITABLE:
-        css = "status-safe"
-        icon = "🟢"
-        label = "SAFE" if response.query_language == "en" else "آمن"
+        css, icon, label = "mw-status-safe", "✅", "SAFE"
+        hint = "This product appears suitable for your child."
+        if response.query_language == "ar":
+            label, hint = "آمن", "يبدو أن هذا المنتج مناسب لطفلك."
     elif rec == Recommendation.NOT_SUITABLE:
-        css = "status-unsafe"
-        icon = "🔴"
-        label = "UNSAFE" if response.query_language == "en" else "غير آمن"
+        css, icon, label = "mw-status-unsafe", "⛔", "NOT SUITABLE"
+        hint = "This product may not be safe for your child."
+        if response.query_language == "ar":
+            label, hint = "غير مناسب", "قد لا يكون هذا المنتج آمناً لطفلك."
     else:
-        css = "status-uncertain"
-        icon = "🟡"
-        label = "UNCERTAIN" if response.query_language == "en" else "غير مؤكد"
+        css, icon, label = "mw-status-uncertain", "⚠️", "UNCERTAIN"
+        hint = "We couldn't confidently assess this product."
+        if response.query_language == "ar":
+            label, hint = "غير مؤكد", "لم نتمكن من تقييم هذا المنتج بثقة."
 
     st.markdown(f"""
-    <div class="status-banner {css}">
-        <div class="status-icon">{icon}</div>
-        <p class="status-label">{label}</p>
+    <div class="mw-status {css}">
+        <div class="mw-status-icon">{icon}</div>
+        <div class="mw-status-label">{label}</div>
+        <div class="mw-status-hint">{hint}</div>
     </div>
     """, unsafe_allow_html=True)
 
-    # === DETAILS + SAFETY FLAGS ===
-    col1, col2 = st.columns(2)
+    # ── Uncertain: friendly fallback message ──
+    if rec == Recommendation.UNCERTAIN:
+        st.info("💡 **Tip:** Try rephrasing your question with the exact product name and your child's age for a more accurate assessment.")
 
-    with col1:
-        st.subheader("Product Details")
+    # ── Product Details Card ──
+    has_product_info = response.product_name or response.product_id or response.age_range_months
+    if has_product_info or response.confidence > 0:
+        details_html = '<div class="mw-card"><div class="mw-section-title">Product Details</div>'
         if response.product_name:
-            st.write(f"**Product:** {response.product_name}")
+            details_html += f"""
+            <div class="mw-detail-row">
+                <span class="mw-detail-key">Product</span>
+                <span class="mw-detail-val">{response.product_name}</span>
+            </div>"""
         if response.product_id:
-            st.write(f"**ID:** `{response.product_id}`")
+            details_html += f"""
+            <div class="mw-detail-row">
+                <span class="mw-detail-key">ID</span>
+                <span class="mw-detail-val" style="font-family:monospace">{response.product_id}</span>
+            </div>"""
         if response.age_range_months:
-            st.write(f"**Age Range:** {response.age_range_months} months")
+            details_html += f"""
+            <div class="mw-detail-row">
+                <span class="mw-detail-key">Age Range</span>
+                <span class="mw-detail-val">{response.age_range_months} months</span>
+            </div>"""
 
-        # Confidence bar
-        st.write(f"**Confidence:** {response.confidence:.0%}")
-        bar_color = "#28a745" if response.confidence > 0.7 else "#ffc107" if response.confidence > 0.4 else "#dc3545"
-        st.markdown(
-            f'<div class="confidence-container">'
-            f'<div style="background:#e0e0e0;border-radius:4px;height:10px;">'
-            f'<div style="background:{bar_color};width:{response.confidence*100}%;height:10px;border-radius:4px;'
-            f'transition:width 0.5s ease;"></div>'
-            f'</div></div>',
-            unsafe_allow_html=True,
-        )
+        # Confidence
+        color = conf_color(response.confidence)
+        details_html += f"""
+        <div class="mw-detail-row" style="border-bottom:none">
+            <span class="mw-detail-key">Confidence</span>
+            <span class="mw-detail-val" style="color:{color}">{response.confidence:.0%}</span>
+        </div>
+        <div class="mw-conf-track">
+            <div class="mw-conf-fill" style="width:{response.confidence*100}%;background:{color}"></div>
+        </div>
+        """
+        details_html += "</div>"
+        st.markdown(details_html, unsafe_allow_html=True)
 
-    with col2:
-        st.subheader("Safety Flags")
-        if response.safety_flags:
-            flags_html = ""
-            for flag in response.safety_flags:
-                flag_val = flag.value if hasattr(flag, "value") else str(flag)
-                css_class = get_flag_class(flag_val)
-                flags_html += f'<span class="safety-flag {css_class}">{flag_val.replace("_", " ").upper()}</span>'
-            st.markdown(flags_html, unsafe_allow_html=True)
-        else:
-            st.success("No safety concerns identified.")
+    # ── Reasoning Card ──
+    if response.reasoning:
+        reasoning_html = f"""
+        <div class="mw-card">
+            <div class="mw-section-title">Reasoning</div>
+            <div class="mw-reasoning">{response.reasoning}</div>
+        </div>"""
+        st.markdown(reasoning_html, unsafe_allow_html=True)
 
-    # === REASONING SUMMARY ===
-    st.subheader("Reasoning")
-    st.write(response.reasoning)
+    # ── Safety Flags ──
+    visible_flags = [f for f in response.safety_flags
+                     if (f.value if hasattr(f, "value") else str(f)) != "insufficient_data"]
+    if visible_flags:
+        flags_html = '<div class="mw-card"><div class="mw-section-title">Safety Flags</div><div class="mw-flags">'
+        for flag in visible_flags:
+            fval = flag.value if hasattr(flag, "value") else str(flag)
+            label, css_class = get_flag_display(fval)
+            flags_html += f'<span class="mw-flag {css_class}">{label}</span>'
+        flags_html += "</div>"
 
-    # === REASONING TRACE (the wow factor) ===
+        # Rules applied
+        if response.rule_applied:
+            flags_html += '<div style="margin-top:12px"><div class="mw-section-title">Rules Applied</div>'
+            for rule in response.rule_applied:
+                flags_html += f'<span class="mw-rule">{rule}</span>'
+            flags_html += "</div>"
+
+        flags_html += "</div>"
+        st.markdown(flags_html, unsafe_allow_html=True)
+
+    # ── Reasoning Trace (collapsible) ──
     if response.reasoning_trace:
-        st.subheader("Reasoning Trace")
-        for i, step in enumerate(response.reasoning_trace, 1):
-            is_override = step.startswith("[OVERRIDE]")
-            css_class = "trace-step trace-override" if is_override else "trace-step"
-            st.markdown(
-                f'<div class="{css_class}"><strong>Step {i}:</strong> {step}</div>',
-                unsafe_allow_html=True,
-            )
+        with st.expander("Show reasoning trace"):
+            trace_html = ""
+            for i, step in enumerate(response.reasoning_trace, 1):
+                is_override = step.startswith("[OVERRIDE]")
+                css = "mw-trace-step mw-trace-override" if is_override else "mw-trace-step"
+                trace_html += f'<div class="{css}"><span class="mw-trace-num">{i}.</span>{step}</div>'
+            st.markdown(trace_html, unsafe_allow_html=True)
 
-    # === ALTERNATIVES ===
+    # ── Alternatives ──
     if response.alternatives:
-        st.subheader("Safer Alternatives")
+        alts_html = '<div class="mw-card"><div class="mw-section-title">Safer Alternatives</div>'
         for alt in response.alternatives:
-            st.markdown(
-                f'<div class="alt-card">'
-                f'<strong>{alt.name}</strong> (<code>{alt.product_id}</code>)<br/>'
-                f'{alt.reason}</div>',
-                unsafe_allow_html=True,
-            )
+            alts_html += f"""
+            <div class="mw-alt">
+                <span class="mw-alt-name">{alt.name}</span>
+                <span class="mw-alt-id">{alt.product_id}</span>
+                <div class="mw-alt-reason">{alt.reason}</div>
+            </div>"""
+        alts_html += "</div>"
+        st.markdown(alts_html, unsafe_allow_html=True)
 
-    # === DISCLAIMER ===
-    st.caption(f"⚠️ {response.disclaimer}")
+    # ── Disclaimer ──
+    st.markdown(f'<div class="mw-disclaimer">⚠️ {response.disclaimer}</div>', unsafe_allow_html=True)
 
 
+# ──────────────────────────────────────────────
+# Main App
+# ──────────────────────────────────────────────
 def main():
-    # Header
-    st.markdown('<div class="main-header">', unsafe_allow_html=True)
-    st.title("🧸 Mumzworld Smart Product Advisor")
-    st.write("*AI-powered product safety checker for parents — English & Arabic*")
-    st.markdown("</div>", unsafe_allow_html=True)
+    # ── Header ──
+    st.markdown("""
+    <div class="mw-header">
+        <div class="mw-logo">mumz<span>world</span></div>
+        <div class="mw-tagline">AI Product Safety Advisor</div>
+        <div class="mw-subtext">Helping parents make safe decisions</div>
+    </div>
+    """, unsafe_allow_html=True)
 
-    # Initialize advisor (cached)
+    # ── Initialize advisor (cached) ──
     @st.cache_resource
     def get_advisor():
         return ProductAdvisor()
@@ -207,71 +495,57 @@ def main():
         st.error(f"⚠️ {str(e)}")
         st.stop()
 
-    # Example queries in tabs
-    st.subheader("Try these examples:")
-    example_col1, example_col2 = st.columns(2)
-
-    examples_en = [
+    # ── Example queries ──
+    st.markdown("")
+    examples = [
         "Is the Chicco stroller safe for a 3-month-old?",
+        "هل لعبة الليغو مناسبة لطفل عمره سنة؟",
         "Can my 15kg toddler use the Infantino swing?",
         "Is the marble run set safe for a 2-year-old?",
-        "Is the XYZ-9999 blender safe for my baby?",
     ]
-    examples_ar = [
-        "هل عربة شيكو آمنة لطفل عمره 3 أشهر؟",
-        "هل لعبة الليغو مناسبة لطفل عمره سنة؟",
-        "أريد كرسي سيارة لطفلي عمره 3 أشهر",
-    ]
-
-    with example_col1:
-        st.write("**English:**")
-        for ex in examples_en:
-            if st.button(ex, key=f"en_{ex[:25]}"):
+    cols = st.columns(len(examples))
+    for i, ex in enumerate(examples):
+        with cols[i]:
+            if st.button(ex[:28] + "…" if len(ex) > 28 else ex, key=f"ex_{i}", use_container_width=True):
                 st.session_state.query = ex
 
-    with example_col2:
-        st.write("**العربية:**")
-        for ex in examples_ar:
-            if st.button(ex, key=f"ar_{ex[:25]}"):
-                st.session_state.query = ex
-
-    st.divider()
-
-    # Query input
+    st.markdown('<div class="input-card">', unsafe_allow_html=True)
+    
+    # ── Query Input ──
     query = st.text_area(
-        "Ask about a product (English or Arabic):",
+        "Ask about product safety",
         value=st.session_state.get("query", ""),
         height=80,
         placeholder="e.g., Is this stroller safe for my 6-month-old? / هل هذه العربة آمنة لطفل عمره 6 أشهر؟",
+        label_visibility="collapsed",
     )
 
-    col_btn1, col_btn2, _ = st.columns([1, 1, 4])
-    with col_btn1:
-        submit = st.button("🔍 Check Safety", type="primary", use_container_width=True)
-    with col_btn2:
-        clear = st.button("🗑️ Clear", use_container_width=True)
+    col_btn, col_clear, _ = st.columns([1.2, 0.8, 3])
+    with col_btn:
+        submit = st.button("🛡️ Check Safety", type="primary", use_container_width=True)
+    with col_clear:
+        if st.button("Clear", use_container_width=True):
+            st.session_state.query = ""
+            st.rerun()
+            
+    st.markdown('</div>', unsafe_allow_html=True)
 
-    if clear:
-        st.session_state.query = ""
-        st.rerun()
-
+    # ── Results ──
     if submit and query.strip():
-        with st.spinner("Analyzing product safety..."):
+        with st.spinner("Analyzing product safety…"):
             start = time.time()
             response = advisor.query(query.strip())
             elapsed = time.time() - start
 
-        st.success(f"Analysis complete in {elapsed:.1f}s")
-
-        # Render formatted response
+        st.caption(f"Analysis completed in {elapsed:.1f}s")
         render_response(response)
 
-        # Raw JSON (collapsible)
-        with st.expander("Raw JSON Response"):
+        # Raw JSON
+        with st.expander("View raw JSON"):
             st.json(json.loads(response.model_dump_json()))
 
     elif submit:
-        st.warning("Please enter a question about a Mumzworld product.")
+        st.warning("Please enter a question about a product.")
 
 
 if __name__ == "__main__":
