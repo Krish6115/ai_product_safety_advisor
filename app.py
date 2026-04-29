@@ -164,16 +164,22 @@ html, body, [class*="css"] {
 [data-testid="stSidebarContent"]   { display: none !important; }
 
 /* with layout=wide, remove all default padding from block container */
-.block-container {
-    padding: 0 !important;
+.block-container, [data-testid="stMainBlockContainer"] {
+    padding-left: 0rem !important;
+    padding-right: 0rem !important;
+    padding-top: 0rem !important;
+    padding-bottom: 0rem !important;
     max-width: 100% !important;
+    overflow-x: hidden !important;
 }
 [data-testid="stVerticalBlock"]       { gap: 0 !important; }
 [data-testid="stMarkdownContainer"] p { margin: 0 !important; }
 
 /* ═══ HEADER — full viewport width ═══ */
 .mw-header {
-    width: 100%;
+    width: 100vw;
+    margin-left: calc(-50vw + 50%);
+    margin-right: calc(-50vw + 50%);
     background: #d12d59;
     padding: 16px 32px 14px;
     box-shadow: 0 3px 20px rgba(209, 45, 89, 0.25);
@@ -181,6 +187,7 @@ html, body, [class*="css"] {
     align-items: center;
     justify-content: space-between;
     gap: 16px;
+    box-sizing: border-box;
 }
 .mw-brand img {
     height: 75px;
