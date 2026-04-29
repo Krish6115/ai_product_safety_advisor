@@ -178,7 +178,7 @@ Together, these videos show how the problem was discovered (product thinking) an
 
 ## 🌐 Live App
 
-**Deployment:** [Streamlit Cloud Deployment Link] *(Insert your deployment link here)*
+**Deployment:** [https://mumzworld.streamlit.app/](https://mumzworld.streamlit.app/)
 
 ![Demo Application](C:\Users\sivar\OneDrive\Desktop\mumzworld-advisor\DEMO.png)
 
@@ -201,13 +201,13 @@ Together, these videos show how the problem was discovered (product thinking) an
 
 ## ⏱️ Time Breakdown
 
-* Exploration & idea: 8 hours
+* Exploration & idea: 2 hours
 * System design: 1 hour
-* Implementation: 3 hours
+* Implementation: 2 hours
 * UI: 2 hours
 * Testing: 1 hour
 
-**Total: ~15 hours**
+**Total: ~8 hours**
 
 ---
 
