@@ -1,5 +1,7 @@
 # Mumzworld Smart Product Advisor (AI Engineering Intern)
 
+![UI Demo](DEMO.png)
+
 ## 🔥 Executive Summary
 
 A multilingual (English + Arabic) AI-powered Product Safety & Suitability Advisor designed to help parents make safe purchasing decisions. This is a **safety-critical system** that prioritizes deterministic rules over open-ended LLM generation, ensuring that every safety recommendation is grounded, highly structured, and strictly adheres to age and hazard constraints.
