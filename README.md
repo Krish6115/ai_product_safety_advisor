@@ -180,7 +180,7 @@ Together, these videos show how the problem was discovered (product thinking) an
 
 **Deployment:** [https://mumzworld.streamlit.app/](https://mumzworld.streamlit.app/)
 
-![Demo Application](C:\Users\sivar\OneDrive\Desktop\mumzworld-advisor\DEMO.png)
+
 
 ---
 
