@@ -731,11 +731,15 @@ USE_LLM = True
 def run_advisor(query: str, child_age_months: Optional[int] = None):
     """Compatibility entry point used by the Streamlit app."""
     result = rule_based_engine(query)
-    if USE_LLM:
+    
+    if USE_LLM and result["recommendation"] == "UNCERTAIN":
         try:
-            pass
-        except:
-            pass
+            adv = _get_default_advisor()
+            llm_response = adv.analyze(query, child_age_months=child_age_months)
+            return llm_response.model_dump()
+        except Exception as exc:
+            logger.warning("LLM pipeline failed, falling back to rules: %s", exc)
+            
     return result
 
 def get_recommendation(query: str, child_age_months: Optional[int] = None):
