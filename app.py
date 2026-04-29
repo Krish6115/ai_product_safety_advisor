@@ -143,9 +143,9 @@ html, body, [class*="css"] {
 /* ═══ HEADER — full viewport width ═══ */
 .mw-header {
     width: 100%;
-    background: linear-gradient(135deg, #ff0055 0%, #c8003e 100%);
+    background: #d12d59;
     padding: 16px 32px 14px;
-    box-shadow: 0 3px 20px rgba(255, 0, 85, 0.25);
+    box-shadow: 0 3px 20px rgba(209, 45, 89, 0.25);
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -434,6 +434,8 @@ def safety_card(result: dict, query: str) -> str:
     rec   = result.get("recommendation","UNCERTAIN")
     conf  = float(result.get("confidence",0))
     rsn   = result.get("reasoning","")
+    explanation = result.get("user_explanation", "") or ""
+    advice = result.get("advice", "") or ""
     flags = result.get("safety_flags",   []) or []
     trace = result.get("reasoning_trace",[]) or []
     alts  = result.get("alternatives",   []) or []
@@ -450,7 +452,10 @@ def safety_card(result: dict, query: str) -> str:
     <div class="sc-track"><div class="sc-fill" style="width:{pct}%"></div></div>
     <span>{pct}% confidence</span>
   </div>
-  <div class="sc-reason">{rsn}</div>"""
+    <div class="sc-st">Explanation</div>
+    <div class="sc-reason">{explanation or rsn}</div>
+    <div class="sc-st">What You Should Do</div>
+    <div class="sc-reason">{advice or rsn}</div>"""
 
     if flags:
         h += '<div class="sc-st">Safety Flags</div><div class="sc-flags">'
@@ -470,12 +475,15 @@ def safety_card(result: dict, query: str) -> str:
   <div class="sc-alt-why">{a.get("reason","")}</div>
 </div>"""
 
-    if trace:
-        items = "".join(f"<li>{t}</li>" for t in trace)
-        h += f"""
+        if rsn or trace:
+                items = "".join(f"<li>{t}</li>" for t in trace)
+                h += f"""
 <details class="sc-tr">
-  <summary>⊞ Reasoning trace ({len(trace)} steps)</summary>
-  <ul class="sc-tr-list">{items}</ul>
+    <summary>⊞ Reasoning details</summary>
+    <div class="sc-st">Technical reasoning</div>
+    <div class="sc-reason">{rsn}</div>
+    <div class="sc-st">Reasoning trace ({len(trace)} steps)</div>
+    <ul class="sc-tr-list">{items}</ul>
 </details>"""
 
     h += "</div>"

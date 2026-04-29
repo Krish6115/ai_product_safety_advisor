@@ -244,6 +244,118 @@ class ProductAdvisor:
 
         return response
 
+    def _build_human_readable_layer(self, response: AdvisorResponse) -> AdvisorResponse:
+        """Populate user-facing explanation and advice from the final decision."""
+        lang = "ar" if response.query_language == "ar" else "en"
+
+        def join_terms(terms: list[str]) -> str:
+            if not terms:
+                return ""
+            if len(terms) == 1:
+                return terms[0]
+            if len(terms) == 2:
+                return f"{terms[0]} and {terms[1]}" if lang == "en" else f"{terms[0]} و {terms[1]}"
+            separator = ", " if lang == "en" else "، "
+            tail_joiner = ", and " if lang == "en" else "، و "
+            return separator.join(terms[:-1]) + tail_joiner + terms[-1]
+
+        flag_values = {flag.value for flag in response.safety_flags}
+        age_flag = SafetyFlag.AGE_INAPPROPRIATE.value in flag_values
+        weight_flag = SafetyFlag.WEIGHT_LIMIT.value in flag_values
+        choking_flag = SafetyFlag.CHOKING_HAZARD.value in flag_values
+        supervision_flag = SafetyFlag.SUPERVISION_REQUIRED.value in flag_values
+        battery_flag = SafetyFlag.BATTERY_HAZARD.value in flag_values
+
+        if response.recommendation == Recommendation.SUITABLE:
+            if lang == "ar":
+                response.user_explanation = (
+                    "هذا المنتج مناسب لطفلك وفقًا للمعلومات المتاحة."
+                    if not (supervision_flag or battery_flag)
+                    else "هذا المنتج مناسب بشكل عام، لكن يجب استخدامه تحت إشراف شخص بالغ."
+                )
+                response.advice = (
+                    "يمكنك استخدامه بأمان. راقب طفلك دائمًا واتبع تعليمات الشركة المصنعة."
+                    if not (supervision_flag or battery_flag)
+                    else "استخدمه تحت إشراف شخص بالغ واتبع تعليمات السلامة بدقة."
+                )
+            else:
+                response.user_explanation = (
+                    "This product appears safe and suitable for your child based on the information available."
+                    if not (supervision_flag or battery_flag)
+                    else "This product is generally suitable, but it should be used with adult supervision."
+                )
+                response.advice = (
+                    "You can use it, but always supervise your child and follow the manufacturer instructions."
+                    if not (supervision_flag or battery_flag)
+                    else "Use it with adult supervision and follow the safety instructions closely."
+                )
+
+        elif response.recommendation == Recommendation.NOT_SUITABLE:
+            if lang == "ar":
+                causes = []
+                if age_flag:
+                    causes.append("هو مخصص لأطفال أكبر سنًا")
+                if weight_flag:
+                    causes.append("وزن طفلك يتجاوز الحد المسموح")
+                if choking_flag:
+                    causes.append("قد يحتوي على أجزاء صغيرة غير مناسبة للأطفال الصغار")
+
+                response.user_explanation = (
+                    f"هذا المنتج غير مناسب لأن {join_terms(causes)}." if causes else "هذا المنتج غير مناسب وفقًا لمعلومات السلامة المتاحة."
+                )
+
+                advice_parts = []
+                if age_flag:
+                    advice_parts.append("اختر منتجًا مناسبًا لعمر طفلك")
+                if weight_flag:
+                    advice_parts.append("اختر منتجًا بحد وزن أعلى")
+                if choking_flag:
+                    advice_parts.append("اختر ألعابًا بدون أجزاء صغيرة قابلة للفصل")
+
+                if not advice_parts:
+                    response.advice = "تجنب هذا المنتج واختر بديلاً أكثر أمانًا."
+                elif len(advice_parts) == 1:
+                    response.advice = f"تجنب هذا المنتج و{advice_parts[0]}."
+                else:
+                    response.advice = "تجنب هذا المنتج واختر بديلاً أكثر أمانًا يناسب عمر طفلك واحتياجات السلامة."
+            else:
+                causes = []
+                if age_flag:
+                    causes.append("it is meant for older children")
+                if weight_flag:
+                    causes.append("your child exceeds the weight limit")
+                if choking_flag:
+                    causes.append("it may contain small parts")
+
+                response.user_explanation = (
+                    f"This product is not suitable because {join_terms(causes)}." if causes else "This product is not suitable based on the safety information available."
+                )
+
+                advice_parts = []
+                if age_flag:
+                    advice_parts.append("choose a product rated for your child's age")
+                if weight_flag:
+                    advice_parts.append("choose a product with a higher weight limit")
+                if choking_flag:
+                    advice_parts.append("choose toys without small detachable parts")
+
+                if not advice_parts:
+                    response.advice = "Avoid this product and choose a safer alternative."
+                elif len(advice_parts) == 1:
+                    response.advice = f"Avoid this product and {advice_parts[0]}."
+                else:
+                    response.advice = "Avoid this product and choose a safer alternative that matches your child's age and safety needs."
+
+        else:
+            if lang == "ar":
+                response.user_explanation = "لا نملك معلومات كافية لتأكيد سلامة هذا المنتج."
+                response.advice = "يرجى مشاركة اسم المنتج وعمر الطفل أو وزنه حتى نتمكن من التحقق مرة أخرى."
+            else:
+                response.user_explanation = "We don't have enough information to confirm safety."
+                response.advice = "Please share the product name and your child's age or weight so we can check again."
+
+        return response
+
     def query(self, user_query: str) -> AdvisorResponse:
         """Process a user query and return a structured safety assessment.
 
@@ -261,7 +373,7 @@ class ProductAdvisor:
             product_context, safety_context, best_score = get_retrieval_context(user_query)
         except Exception:
             # If RAG fails, return uncertain response
-            return AdvisorResponse(
+            return self._build_human_readable_layer(AdvisorResponse(
                 query_language=lang,
                 recommendation=Recommendation.UNCERTAIN,
                 confidence=0.1,
@@ -270,12 +382,12 @@ class ProductAdvisor:
                 else "غير قادر على استرداد معلومات المنتج. يرجى المحاولة مرة أخرى.",
                 reasoning_trace=["RAG retrieval failed", "Returning UNCERTAIN due to system error"],
                 safety_flags=[SafetyFlag.INSUFFICIENT_DATA],
-            )
+            ))
 
         # Step 2b: Check retrieval quality — if score is too low, data is insufficient
         threshold = 0.25 if lang == "ar" else RETRIEVAL_THRESHOLD
         if best_score < threshold:
-            return AdvisorResponse(
+            return self._build_human_readable_layer(AdvisorResponse(
                 query_language=lang,
                 recommendation=Recommendation.UNCERTAIN,
                 confidence=max(0.1, best_score),
@@ -289,7 +401,7 @@ class ProductAdvisor:
                     "Returning UNCERTAIN — refusing to guess",
                 ],
                 safety_flags=[SafetyFlag.INSUFFICIENT_DATA],
-            )
+            ))
 
         # Step 3: Run tools on retrieved products
         from rag.retriever import search_products
@@ -346,16 +458,16 @@ class ProductAdvisor:
                 parsed.query_language = lang
                 child_age = self._extract_child_age(user_query)
                 parsed = self._apply_uncertainty_threshold(parsed, child_age)
-                return parsed
+                return self._build_human_readable_layer(parsed)
 
             raise ValueError("Failed to parse LLM response after retry")
 
         except Exception as e:
-            return AdvisorResponse(
+            return self._build_human_readable_layer(AdvisorResponse(
                 query_language=lang,
                 recommendation=Recommendation.UNCERTAIN,
                 confidence=0.0,
                 reasoning=f"LLM call failed: {str(e)}",
                 reasoning_trace=["LLM API call failed", f"Error: {str(e)}", "Returning UNCERTAIN"],
                 safety_flags=[SafetyFlag.INSUFFICIENT_DATA],
-            )
+            ))

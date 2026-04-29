@@ -35,6 +35,14 @@ class AdvisorResponse(BaseModel):
     recommendation: Recommendation = Field(description="SUITABLE / NOT_SUITABLE / UNCERTAIN")
     confidence: float = Field(ge=0.0, le=1.0, description="Confidence score 0-1")
     reasoning: str = Field(description="Summary explanation in user's language")
+    user_explanation: str = Field(
+        default="",
+        description="Short parent-friendly explanation in plain language"
+    )
+    advice: str = Field(
+        default="",
+        description="Short actionable guidance for the parent"
+    )
     reasoning_trace: list[str] = Field(
         default_factory=list,
         description="Step-by-step reasoning trace showing how the decision was made"
