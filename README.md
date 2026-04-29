@@ -57,19 +57,26 @@ User Query
 
 ---
 
-## 🚀 Run locally
+## ⚙️ Setup & Run (Under 5 Minutes)
 
 ```bash
+git clone <repo>
+cd mumzworld-advisor
+
+python -m venv venv
+# Windows:
+venv\Scripts\activate
+# Mac/Linux:
+# source venv/bin/activate
+
 pip install -r requirements.txt
+
+# Add your Gemini API key
+copy .env.example .env
+
+# Run app
 streamlit run app.py
 ```
-
-## 🌐 Deploy on Streamlit Cloud
-
-* Push repo to GitHub
-* Go to https://share.streamlit.io/
-* Select repo and app.py
-* Deploy
 
 ---
 
