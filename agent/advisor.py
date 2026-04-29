@@ -726,7 +726,7 @@ def rule_based_engine(query: str):
     return uncertain("We don’t have enough information to confirm safety.",
                      "Verify with the manufacturer or a pediatrician.")
 
-USE_LLM = False
+USE_LLM = True
 
 def run_advisor(query: str, child_age_months: Optional[int] = None):
     """Compatibility entry point used by the Streamlit app."""
