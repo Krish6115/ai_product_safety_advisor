@@ -46,7 +46,7 @@ Rule Engine (Age check, Danger override) ──[DANGER DETECTED]──▶ Fast-T
 RAG Retrieval (ChromaDB + embeddings)
    │
    ▼
-Optional LLM Enrichment (Gemini Flash)
+Optional LLM Enrichment (Bharat Code LLM)
    │
    ▼
 Structured Output (Pydantic validation)
@@ -80,7 +80,7 @@ UI (Streamlit)
 * **Streamlit** (UI)
 * **Pydantic v2** (Validation & Structuring)
 * **ChromaDB + sentence-transformers** (Vector DB & Embeddings)
-* **Gemini 2.0 Flash** (Optional LLM layer; currently gracefully degraded to use the rule engine for the demo)
+* **Bharat Code (Qwen 3.8)** (Optional LLM layer; currently gracefully degraded to use the rule engine for the demo)
 
 ---
 

@@ -4,7 +4,7 @@ agent/advisor.py — AI Product Safety Advisor (production-grade)
 Safety pipeline (in order):
   1. classify_query()           — keyword + pattern gate, NO LLM call for DANGEROUS
   2. RAG retrieval              — ChromaDB semantic search
-  3. LLM structured generation — Gemini Flash via google-generativeai
+  3. LLM structured generation — Bharat Code (OpenAI-compatible API)
   4. _apply_hard_overrides()   — rule-based post-LLM safety net
   5. _build_human_readable_layer() — generates user_explanation + advice
 
@@ -20,7 +20,7 @@ import json
 import logging
 from typing import Optional
 
-from google import genai
+from openai import OpenAI
 from dotenv import load_dotenv
 
 from agent.schemas import (
@@ -33,9 +33,10 @@ from agent.schemas import (
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-# ── Gemini setup ───────────────────────────────────────────────────────────────
-_API_KEY = os.getenv("GEMINI_API_KEY", "")
-_MODEL_NAME = "gemini-2.0-flash"
+# ── Bharat Code LLM setup (OpenAI-compatible) ──────────────────────────────────
+_API_KEY = os.getenv("BHARATCODE_API_KEY", "")
+_BASE_URL = os.getenv("BHARATCODE_BASE_URL", "https://bharatcode.ai/api/model/v1")
+_MODEL_NAME = os.getenv("BHARATCODE_MODEL", "qwen-3.8-27b")
 _CONFIDENCE_THRESHOLD = 0.6
 _RETRIEVAL_THRESHOLD = 0.4
 
@@ -423,7 +424,7 @@ class SafetyAdvisor:
 
     def __init__(self, retriever):
         self.retriever = retriever
-        self.client = genai.Client(api_key=_API_KEY) if _API_KEY else None
+        self.client = OpenAI(api_key=_API_KEY, base_url=_BASE_URL) if _API_KEY else None
 
     # ── Public entry point ─────────────────────────────────────────────────────
 
@@ -540,13 +541,14 @@ SAFETY RULES (you must apply these):
 Return ONLY the JSON object. No markdown, no explanation, no code fences."""
 
         if self.client is None:
-            raise RuntimeError("GEMINI_API_KEY is not configured")
+            raise RuntimeError("BHARATCODE_API_KEY is not configured")
 
-        response = self.client.models.generate_content(
+        response = self.client.chat.completions.create(
             model=_MODEL_NAME,
-            contents=prompt,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
         )
-        return response.text
+        return response.choices[0].message.content or ""
 
     def _parse_llm_response(
         self,
