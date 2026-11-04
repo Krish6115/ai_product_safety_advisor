@@ -462,17 +462,24 @@ class SafetyAdvisor:
             response = self._uncertain_fallback(query, classification)
 
         # ── Step 4: Hard overrides ────────────────────────────────────────────
+        llm_rec = response.recommendation
         response = _apply_hard_overrides(response, child_age_months)
 
         # ── Step 5: Human-readable layer ──────────────────────────────────────
-        explanation, advice = _build_human_readable_layer(
-            recommendation=Recommendation(response.recommendation),
-            safety_flags=response.safety_flags,
-            child_age_months=child_age_months,
-        )
-        response = response.model_copy(
-            update={"user_explanation": explanation, "advice": advice}
-        )
+        # Keep the LLM's own wording unless it is missing or a hard override changed the verdict.
+        if (
+            response.user_explanation == "__pending__"
+            or response.advice == "__pending__"
+            or response.recommendation != llm_rec
+        ):
+            explanation, advice = _build_human_readable_layer(
+                recommendation=Recommendation(response.recommendation),
+                safety_flags=response.safety_flags,
+                child_age_months=child_age_months,
+            )
+            response = response.model_copy(
+                update={"user_explanation": explanation, "advice": advice}
+            )
 
         return response
 
@@ -520,11 +527,13 @@ RETRIEVED PRODUCT/SAFETY CONTEXT:
 Return ONLY a valid JSON object with these exact fields:
 {{
   "query_language": "<ISO 639-1 code>",
-  "recommendation": "<SAFE | NOT_SUITABLE | UNCERTAIN>",
+  "recommendation": "<SUITABLE | NOT_SUITABLE | UNCERTAIN>",
   "confidence": <float 0.0-1.0>,
   "safety_flags": ["<flag1>", "<flag2>"],
   "reasoning": "<concise internal reasoning>",
   "reasoning_trace": ["<step 1>", "<step 2>", "..."],
+  "user_explanation": "<2-3 friendly sentences for a parent explaining the verdict and why, specific to this product/question>",
+  "advice": "<one clear, actionable instruction for the parent>",
   "alternatives": [
     {{"product_id": "<id>", "name": "<name>", "reason": "<why safer>"}}
   ]
@@ -536,7 +545,7 @@ SAFETY RULES (you must apply these):
 - If the product has been recalled → NOT_SUITABLE, flag: product_recalled
 - If the product contains toxic materials → NOT_SUITABLE, flag: toxic_material
 - If information is insufficient to make a confident determination → UNCERTAIN
-- Only return SAFE when you have clear positive evidence from the context
+- Only return SUITABLE when you have clear positive evidence from the context
 
 Return ONLY the JSON object. No markdown, no explanation, no code fences."""
 
@@ -568,6 +577,12 @@ Return ONLY the JSON object. No markdown, no explanation, no code fences."""
             logger.error("JSON parse failed: %s\nRaw: %r", exc, raw[:500])
             raise ValueError(f"LLM returned unparseable JSON: {exc}") from exc
 
+        # The schema's enum is SUITABLE; models often answer SAFE.
+        if str(data.get("recommendation", "")).strip().upper() in ("SAFE", "SUITABLE"):
+            data["recommendation"] = "SUITABLE"
+        else:
+            data["recommendation"] = str(data.get("recommendation", "UNCERTAIN")).strip().upper()
+
         # Enforce UNCERTAIN if retrieval score too low
         if retrieval_score < _RETRIEVAL_THRESHOLD:
             data["recommendation"] = "UNCERTAIN"
@@ -578,15 +593,15 @@ Return ONLY the JSON object. No markdown, no explanation, no code fences."""
 
         # Enforce UNCERTAIN if LLM confidence too low
         llm_confidence = float(data.get("confidence", 0.0))
-        if llm_confidence < _CONFIDENCE_THRESHOLD and data.get("recommendation") == "SAFE":
+        if llm_confidence < _CONFIDENCE_THRESHOLD and data.get("recommendation") == "SUITABLE":
             data["recommendation"] = "UNCERTAIN"
             data.setdefault("reasoning_trace", []).append(
                 f"[THRESHOLD] LLM confidence {llm_confidence:.2f} < {_CONFIDENCE_THRESHOLD} — SAFE downgraded to UNCERTAIN."
             )
 
-        # Placeholder explanations — will be overwritten by _build_human_readable_layer
-        data["user_explanation"] = "__pending__"
-        data["advice"] = "__pending__"
+        # Keep the LLM-written explanation/advice; templates are only a fallback.
+        data["user_explanation"] = str(data.get("user_explanation") or "").strip() or "__pending__"
+        data["advice"] = str(data.get("advice") or "").strip() or "__pending__"
         data["query_classification"] = classification.value
 
         return SafetyResponse(**data)
@@ -731,17 +746,31 @@ def rule_based_engine(query: str):
 USE_LLM = True
 
 def run_advisor(query: str, child_age_months: Optional[int] = None):
-    """Compatibility entry point used by the Streamlit app."""
+    """Entry point used by the Streamlit app: LLM answers every query, rules are the safety net."""
     result = rule_based_engine(query)
-    
-    if USE_LLM and result["recommendation"] == "UNCERTAIN":
+    if child_age_months is None:
+        child_age_months = extract_age_months(query)
+
+    if USE_LLM:
         try:
             adv = _get_default_advisor()
-            llm_response = adv.analyze(query, child_age_months=child_age_months)
-            return llm_response.model_dump()
+            if adv.client is None:
+                raise RuntimeError("BHARATCODE_API_KEY is not configured")
+            llm = adv.analyze(query, child_age_months=child_age_months).model_dump()
+            # A hard rule hit (e.g. choking, dangerous action) can never be downgraded by the LLM.
+            if result["recommendation"] == "NOT_SUITABLE" and llm["recommendation"] != "NOT_SUITABLE":
+                llm["recommendation"] = "NOT_SUITABLE"
+                llm["safety_flags"] = list(dict.fromkeys(llm["safety_flags"] + result["safety_flags"]))
+                llm["confidence"] = max(llm["confidence"], 0.9)
+                llm["user_explanation"] = result["user_explanation"]
+                llm["advice"] = result["advice"]
+            # LLM could not produce a verdict (its own error fallback): use the rule answer instead.
+            if llm["confidence"] == 0.0 and "LLM call failed" in " ".join(llm.get("reasoning_trace", [])):
+                return result
+            return llm
         except Exception as exc:
             logger.warning("LLM pipeline failed, falling back to rules: %s", exc)
-            
+
     return result
 
 def get_recommendation(query: str, child_age_months: Optional[int] = None):

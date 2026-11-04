@@ -22,6 +22,13 @@ def _get_client() -> chromadb.ClientAPI:
     global _client
     if _client is None:
         _client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+        # chroma_db/ is git-ignored, so a fresh clone / Streamlit Cloud deploy starts empty: build it.
+        existing = {c if isinstance(c, str) else c.name for c in _client.list_collections()}
+        if not {"products", "safety_guidelines"} <= existing:
+            from rag.ingest import ingest
+
+            ingest()
+            _client = chromadb.PersistentClient(path=str(CHROMA_DIR))
     return _client
 
 
